@@ -6,7 +6,7 @@ import path from 'node:path';
 import {CalendarStore} from '../src/store.js';
 import {ReminderScheduler} from '../src/scheduler.js';
 import {ICloudSync} from '../src/icloud-sync.js';
-import {ICloudDAV,appleURL,loadCloudCredentials} from '../src/icloud-dav.js';
+import {ICloudDAV,appleURL,loadCloudCredentials,cloudFailureMessage} from '../src/icloud-dav.js';
 import {encodeEvent,parseEvent,fieldsFor} from '../src/icloud-codec.js';
 import {startService,tokenFor} from '../src/service.js';
 import {readConfig} from '../src/config.js';
@@ -192,4 +192,27 @@ test('running service reloads cloud configuration without opening a second store
   config.icloud.enabled=false;await fs.writeFile(file,JSON.stringify(config));
   await fetch(url+'icloud/reload',{method:'POST',headers,body:'{}'});
   const after=await(await fetch(url+'state',{headers})).json();assert.equal(after.syncBackend,'mac');assert.equal(after.items.length,1);
+});
+
+test('setup discovery distinguishes rejected authentication without leaking response bodies or credentials',async()=>{
+  const dav=new ICloudDAV({username:'private@example.com',password:'private-password'},{fetchImpl:async()=>new Response('private response',{status:401})});
+  let error;try{await dav.discover();}catch(e){error=e;}
+  assert.ok(error);
+  const message=cloudFailureMessage(error.cloudDiagnostic??dav.diagnostic);
+  assert.match(message,/Apple 拒绝了认证/);assert.match(message,/HTTP 401/);assert.match(message,/查找账户入口/);
+  assert.doesNotMatch(message,/private|Basic/);
+});
+
+test('setup diagnostics separate DNS, timeouts, TLS, forbidden endpoints and DAV discovery failures',async()=>{
+  for(const [code,pattern] of [['ENOTFOUND',/DNS/],['ETIMEDOUT',/超时/],['UNABLE_TO_VERIFY_LEAF_SIGNATURE',/TLS/]]) {
+    const dav=new ICloudDAV({username:'private',password:'private'},{fetchImpl:async()=>{throw new TypeError('private-error',{cause:new AggregateError([Object.assign(Error('private-error'),{code})])});}});
+    await assert.rejects(dav.discover());const message=cloudFailureMessage(dav.diagnostic);
+    assert.match(message,pattern);assert.doesNotMatch(message,/private-error/);
+  }
+  const blocked=new ICloudDAV({username:'private',password:'private'},{fetchImpl:async()=>new Response(null,{status:302,headers:{location:'https://outside.invalid/private-account'}})});
+  await assert.rejects(blocked.discover());assert.match(cloudFailureMessage(blocked.diagnostic),/尚未支持的地址/);
+  assert.doesNotMatch(cloudFailureMessage(blocked.diagnostic),/outside|private-account/);
+  const malformed=new ICloudDAV({username:'private',password:'private'},{fetchImpl:async()=>new Response('<html>private response</html>',{status:200})});
+  await assert.rejects(malformed.discover());const message=cloudFailureMessage(malformed.diagnostic);
+  assert.match(message,/未能解析或发现/);assert.match(message,/HTTP 200/);assert.doesNotMatch(message,/private/);
 });

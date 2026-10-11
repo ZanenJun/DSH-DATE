@@ -4,10 +4,44 @@ import { DAVClient } from 'tsdav';
 export function appleURL(value) {
   const u = new URL(value);
   if (u.protocol !== 'https:' || u.username || u.password || u.hash || u.search || (u.port && u.port !== '443')
-    || !(u.hostname === 'caldav.icloud.com' || /^p\d+-caldav\.icloud\.com$/.test(u.hostname) || /^p\d+\.caldav\.icloud\.com$/.test(u.hostname))) throw Error('只允许 Apple iCloud CalDAV HTTPS 地址');
+    || !(u.hostname === 'caldav.icloud.com' || /^p\d+-caldav\.icloud\.com$/.test(u.hostname) || /^p\d+\.caldav\.icloud\.com$/.test(u.hostname))) throw Object.assign(Error('只允许 Apple iCloud CalDAV HTTPS 地址'),{code:'DAV_UNTRUSTED_URL'});
   return u.href;
 }
 export function cloudError(message, status) { return Object.assign(new Error(message), {status}); }
+
+const networkCodes=new Set(['ENOTFOUND','EAI_AGAIN','ECONNREFUSED','ECONNRESET','ENETUNREACH','EHOSTUNREACH','ETIMEDOUT','UND_ERR_CONNECT_TIMEOUT','UND_ERR_HEADERS_TIMEOUT','UND_ERR_SOCKET','CERT_HAS_EXPIRED','UNABLE_TO_VERIFY_LEAF_SIGNATURE','UNABLE_TO_GET_ISSUER_CERT_LOCALLY','DEPTH_ZERO_SELF_SIGNED_CERT','ERR_TLS_CERT_ALTNAME_INVALID','DAV_UNTRUSTED_URL']);
+function failureCode(e,depth=0) {
+  if(!e || depth>4)return null;
+  if(networkCodes.has(e.code))return e.code;
+  if(e.name==='TimeoutError')return 'ETIMEDOUT';
+  return failureCode(e.cause,depth+1) || e.errors?.map(x=>failureCode(x,depth+1)).find(Boolean) || null;
+}
+function requestStage(init) {
+  const body=typeof init.body==='string'?init.body:'';
+  if(body.includes('current-user-principal'))return '查找账户入口';
+  if(body.includes('calendar-home-set'))return '查找日历目录';
+  if(body.includes('supported-report-set'))return '查询日历能力';
+  if(body.includes('displayname'))return '列出日历';
+  return '连接日历服务';
+}
+// Only report our own stage, HTTP status and allowlisted error codes. Never expose
+// library messages, request headers, account paths, response bodies or credentials.
+export function cloudFailureMessage(diagnostic={}) {
+  const {status,code,stage}=diagnostic;
+  let reason;
+  if(code==='DAV_UNTRUSTED_URL')reason='日历发现返回了尚未支持的地址，已阻止发送凭据；需要检查区域服务兼容性';
+  else if(code==='ENOTFOUND'||code==='EAI_AGAIN')reason='DNS 解析失败，请检查服务器 DNS';
+  else if(code==='ETIMEDOUT'||code?.endsWith('_TIMEOUT'))reason='连接 Apple 超时，请检查服务器到 iCloud 的网络';
+  else if(code?.includes('CERT')||code?.includes('SELF_SIGNED')||code?.includes('ISSUER')||code==='UNABLE_TO_VERIFY_LEAF_SIGNATURE')reason='TLS 证书验证失败，请检查服务器时间、证书或代理';
+  else if(code)reason='连接 Apple 时发生网络错误';
+  else if(status===401)reason='Apple 拒绝了认证。请确认邮箱是生成该 App 专用密码的 Apple 账户，且填写的是完整专用密码';
+  else if(status===403)reason='Apple 拒绝访问。请检查账户的 iCloud 日历权限及 App 专用密码';
+  else if(status===429)reason='Apple 请求限流，请稍后重试';
+  else if(status>=500)reason='Apple 日历服务暂时出错，请稍后重试';
+  else reason='未能解析或发现 iCloud 日历，请将这条错误信息交给维护者排查';
+  const detail=[stage,status?`HTTP ${status}`:null,code].filter(Boolean).join('；');
+  return `${reason}${detail?`（${detail}）`:''}。未保存配置。`;
+}
 
 export class ICloudDAV {
   constructor(credentials, { fetchImpl = fetch } = {}) {
@@ -17,17 +51,23 @@ export class ICloudDAV {
       authMethod:'Basic', defaultAccountType:'caldav', fetch:(u, init) => this.request(u, init) });
   }
   async request(value, init = {}) {
+    const diagnostic={stage:requestStage(init),status:null,code:null};
+    try {const response=await this.performRequest(value,init,diagnostic);this.diagnostic=diagnostic;return response;}
+    catch(e) {diagnostic.code=failureCode(e);this.diagnostic=diagnostic;e.cloudDiagnostic=diagnostic;throw e;}
+  }
+  async performRequest(value, init, diagnostic) {
     let url = appleURL(String(value));
     const signal = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(20000), ...(init.signal ? [init.signal] : [])]);
     for (let n=0;n<5;n++) {
       const res = await this.fetchImpl(url, {...init,redirect:'manual',signal});
+      diagnostic.status=res.status;
       if ([301,302,307,308].includes(res.status)) {
         const location=res.headers.get('location'); await res.body?.cancel();
         if (!location) throw Error('iCloud 重定向缺少地址');
         const destination=appleURL(new URL(location,url).href);
         // Discovery needs the redirect itself to resolve subsequent relative DAV paths.
         if(init.redirect==='manual')return new Response(null,{status:res.status,headers:{location:destination}});
-        url=destination; continue;
+        url=destination;diagnostic.status=null;continue;
       }
       if (!res.ok && ![404,412].includes(res.status)) {
         await res.body?.cancel();

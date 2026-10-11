@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline/promises';
-import { ICloudDAV, appleURL } from '../src/icloud-dav.js';
+import { ICloudDAV, appleURL, cloudFailureMessage } from '../src/icloud-dav.js';
 import { digest } from '../src/icloud-codec.js';
 import { readConfig } from '../src/config.js';
 import { atomicJSON } from '../src/store.js';
@@ -36,7 +36,7 @@ export async function setupICloud(configFile) {
   const dav=new ICloudDAV({username,password});
   try {
     let calendars;
-    try{calendars=await dav.discover();}catch{throw Error('无法连接 iCloud。请检查网络、Apple 账户和 App 专用密码；未保存配置。');}
+    try{calendars=await dav.discover();}catch(e){throw Error(cloudFailureMessage(e.cloudDiagnostic??dav.diagnostic));}
     if(!calendars.length)throw Error('未找到可用日历。请先在 iCloud 日历中创建“DSH 日历助手”');
     console.log('选择专用日历（不要选择包含私人会议或邀请的主日历）：');
     calendars.forEach((c,i)=>console.log(`${i+1}. ${c.name}`));
