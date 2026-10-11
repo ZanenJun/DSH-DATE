@@ -94,7 +94,9 @@ struct APIError: Error { let status: Int; let message: String }
             state["endpoint"] = endpoint; try persist()
             UserDefaults.standard.set(endpoint, forKey: "endpoint")
             running = true
-            timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in Task { @MainActor in await self?.sync() } }
+            timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in await self?.sync() }
+            }
             await sync()
         } catch { status = describe(error) }
     }
@@ -175,7 +177,7 @@ struct APIError: Error { let status: Int; let message: String }
         do {
             guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else { throw failure("日历权限已撤回，请重新授权") }
             let c = try refreshedCalendar()
-            details = "正在读取：\(c.title ?? "DSH 日历助手") · \(c.source.title ?? "日历账户")"
+            details = "正在读取：\(c.title) · \(c.source.title)"
             for id in Array((state["pending"] as? Object ?? [:]).keys) { _ = try await replay(id) }
             let response = try await request("state")
             guard response["schemaVersion"] as? Int == 1, let items = response["items"] as? [Object] else {
@@ -197,7 +199,7 @@ struct APIError: Error { let status: Int; let message: String }
                 $0.url?.scheme == "dshcalendar" && $0.url?.host == "item" && remote[String($0.url!.path.dropFirst())] == nil
             }.count
             let duplicateCalendars = store.calendars(for: .event).filter { $0.title == c.title && $0.calendarIdentifier != c.calendarIdentifier }.count
-            let calendarLabel = "\(c.title ?? "DSH 日历助手") · \(c.source.title ?? "日历账户") · 标识末尾 \(c.calendarIdentifier.suffix(8))"
+            let calendarLabel = "\(c.title) · \(c.source.title) · 标识末尾 \(c.calendarIdentifier.suffix(8))"
             details = "\(calendarLabel)\n扫描到 \(found.count) 项；全天/重复 \(unsupported) 项；服务器现有 \(items.filter { $0["deletedAt"] is NSNull }.count) 项。"
             // Recover identifiers after EventKit refresh or a crash between save and mapping persistence.
             for e in found where e.url?.scheme == "dshcalendar" && e.url?.host == "item" {
