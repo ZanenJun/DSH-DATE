@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { localClient } from './client.js';
 import { itemInput } from './model.js';
-const server = new McpServer({ name: 'dsh-calendar-agent', version: '0.1.3' });
+const server = new McpServer({ name: 'dsh-calendar-agent', version: '0.2.0' });
 const call = async (route, args) => {
   try {
     const client = await localClient(process.argv[2]);

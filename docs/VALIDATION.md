@@ -27,3 +27,13 @@ Mac 定时器和界面文案已从 60 秒改为 10 秒，保留正在同步时�
 - 真实 DSH 默认模型的只读预览成功：通过 ctx.agents.create / followup / whenIdle 完成提醒回合；持久 session 日志确认该回合没有工具，输出限制 600 tokens。预览没有写入日历或发送 QQ。
 - 真实 calendar-assistant 会话仍只暴露四个 MCP 工具，calendar_list 调用成功；持久会话记录确认每轮包含 calendar-memory 内容。验证会话已归档。
 - Mac 新增服务器确认时间/时区/版本显示，避免每轮无条件保存，并防止 HTTP 等待期间的新编辑被拉取响应覆盖；这些 EventKit 行为仍需 Mac 实机验收。
+
+## 0.2.0：Linux 直连 iCloud
+
+2026-10-11，Linux / Node 26.8.2 / DSH 0.2.0-rc.2。
+
+- 语法检查及全部 38 项自动测试通过，其中 16 项覆盖 iCloud：时区及 iCalendar 编解码、双向改期取消旧提醒、写入响应丢失后重启去重、双端冲突及显式解决、两轮删除确认、旧 Mac 映射接管、跨年份读取、习惯投影、写入期间本地更新、凭据权限与重定向限制、完整/部分 DAV 报告、旧客户端隔离、日历发现、ETag 条件请求及运行中配置加载。
+- DAV 测试通过真实 tsdav XML 解析和模拟 HTTP 响应，覆盖 principal → home → calendar 的发现流程；未使用真实 Apple 凭据。
+- 本机 DSH 已重新加载插件，QQ 通道连接正常；真实 calendar-assistant 只读会话仍只暴露四个 MCP 工具，并成功调用 calendar_list。验证会话已归档，没有发送真人测试催促。
+- `npm pack --dry-run` 检查包内包含同步代码、命令及文档，不包含运行配置、凭据或个人日历 JSON。
+- **尚未启用真实 iCloud 账户同步**：需要用户在服务器终端运行 icloud-setup，输入账户与 App 专用密码，并完成 iPhone/iCloud 与 Linux 的实际创建、改期、删除验收。在此之前保留原同步后端。

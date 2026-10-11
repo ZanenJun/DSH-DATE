@@ -72,7 +72,7 @@ export class CalendarStore {
       if (owner.id === this.lockId) await fs.unlink(this.lock);
     } catch (e) { if (e.code !== 'ENOENT') throw e; }
   }
-  async upsert({ id = randomUUID(), baseRevision = 0, item, operationId = randomUUID() }) {
+  async upsert({ id = randomUUID(), baseRevision = 0, item, operationId = randomUUID() }, onCommit = () => {}) {
     const normalized = normalizeItem(item);
     if (typeof id !== 'string' || typeof operationId !== 'string' || Object.hasOwn(Object.prototype, id) || id === 'prototype' || Object.hasOwn(Object.prototype, operationId) || operationId === 'prototype' || !/^[\w-]{1,100}$/.test(id) || !/^[\w-]{1,128}$/.test(operationId) || !Number.isInteger(baseRevision) || baseRevision < 0) throw problem('Invalid id');
     return this.transact(d => {
@@ -95,10 +95,11 @@ export class CalendarStore {
         if (occurrence.itemId === id && ['active', 'acknowledged'].includes(occurrence.state) && (scheduleChanged || !next.enabled || next.status !== 'open')) occurrence.state = 'cancelled';
       }
       d.receipts[operationId] = { fingerprint, result: structuredClone(next) };
+      onCommit(d, next);
       return next;
     });
   }
-  async remove({ id, baseRevision, operationId = randomUUID() }) {
+  async remove({ id, baseRevision, operationId = randomUUID() }, onCommit = () => {}) {
     if (typeof id !== 'string' || typeof operationId !== 'string' || Object.hasOwn(Object.prototype, id) || id === 'prototype' || Object.hasOwn(Object.prototype, operationId) || operationId === 'prototype' || !/^[\w-]{1,100}$/.test(id) || !/^[\w-]{1,128}$/.test(operationId) || !Number.isInteger(baseRevision) || baseRevision < 1) throw problem('Invalid delete request');
     return this.transact(d => {
       const fingerprint = JSON.stringify({ delete: id, baseRevision });
@@ -113,6 +114,7 @@ export class CalendarStore {
       remember(d, { type: 'item-deleted', itemId: id, title: item.title }, this.clock());
       for (const o of Object.values(d.occurrences)) if (o.itemId === id && ['active', 'acknowledged'].includes(o.state)) o.state = 'cancelled';
       d.receipts[operationId] = { fingerprint, result: structuredClone(item) };
+      onCommit(d, item);
       return item;
     });
   }

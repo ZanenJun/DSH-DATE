@@ -3,6 +3,7 @@
   "port": 3217,
   "timeZone": "Asia/Shanghai",
   "repeatMs": 30000,
+  "icloud": { "enabled": false, "intervalMs": 10000 },
   "onebot": {
     "ownerQQ": "10001",
     "botQQ": "10002",

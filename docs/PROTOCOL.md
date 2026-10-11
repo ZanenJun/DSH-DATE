@@ -24,16 +24,30 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 
 | 方法和路径 | 输入/输出 |
 | --- | --- |
-| GET /v1/state | 当前时间、时区、星期、QQ 连接状态、items、occurrences 和 memory，包含删除记录 |
+| GET /v1/state | 当前时间、时区、星期、QQ 连接状态、items、occurrences 和 memory，包含删除记录；另含 syncBackend 与 icloud 状态 |
 | POST /v1/reminder-preview | `{itemId?}`；调用真实 DSH Agent 预览正文，返回 text、agentSessionId、dryRun。省略 ID 使用临时示例；不写入待办、不发送 QQ |
 | POST /v1/upsert | `{id, baseRevision, operationId, item}`；创建使用新 ID 与 baseRevision=0，编辑必须保留全部可编辑字段 |
 | POST /v1/delete | `{id, baseRevision, operationId}`；保存删除记录，取消对应催促 |
 | POST /v1/action | `{action: "complete" 或 "snooze" 或 "acknowledge", itemId, occurrenceKey?, minutes?}` |
 | GET /v1/projections | 习惯展开数组；默认过去 7 天到未来 90 天；可传 from/to ISO 日期，最大跨度 366 天 |
+| GET /v1/icloud/status | enabled、running、lastSyncAt、lastError、pending、mapped、unsupported、conflicts |
+| POST /v1/icloud/reload | `{}`；重新读取配置文件的 icloud 段；端口或 dataDir 变化须重启 |
+| POST /v1/icloud/sync | `{}`；等待一轮手动同步，返回状态；HTTP 200 后仍须检查 lastError/conflicts |
+| POST /v1/icloud/resolve | `{id, prefer: "local" 或 "remote"}`；显式解决普通事项冲突 |
 
 状态码 400 输入错误、401 无令牌、403 浏览器请求、404 不存在、409 版本冲突、413 请求过大。upsert/delete 的 operationId 相同且请求一致时返回原结果；重用同一 operationId 提交不同数据返回 409。客户端必须先持久化 ID、operationId 和原请求，再发出请求，网络失败原样重试。删除 ID 不能重新创建，避免离线客户端复活已删除事项。MCP 允许不提供 ID/operationId 以便交互创建，但需要跨网络重试的同步客户端必须显式提供。
 
-Mac 客户端每 10 秒先重试已持久化请求，再读取服务器状态，上传本地变更（比较上一次实际展示的 revision），最后应用远端变更。冲突不静默覆盖。普通事件删除须连续两轮缺失；重复事件采用服务器投影。同步窗口与使用限制见 README。
+旧 Mac 客户端每 10 秒先重试已持久化请求，再读取服务器状态，上传本地变更（比较上一次实际展示的 revision），最后应用远端变更。冲突不静默覆盖。普通事件删除须连续两轮缺失；重复事件采用服务器投影。同步窗口与使用限制见 README。启用 iCloud 后，旧 Mac 应用请求返回 409，避免两个同步后端同时运行。
+
+## iCloud 同步状态（0.2.0）
+
+`syncClients.icloud` 保存账户摘要与日历 URL 绑定、`maps`（UID/href/ETag/本地 revision/最后共同字段）、`pending`（发出前持久化的请求）、`conflicts`（冲突原因及远端副本）和最近状态。不含 Apple 密码；凭据独立保存于权限 600 的文件。导入事项和对应映射在同一存储事务提交。
+
+单个同步循环串行执行：重试 pending → 全量 VEVENT REPORT → 比较共同字段及本地 revision → 导入/排队写入 → 更新习惯投影 → 发出条件请求。PUT 创建用 If-None-Match: *，更新/删除用 If-Match: ETag；写入后 GET 校验。收到响应前崩溃时，下轮按 UID 与内容核验是否已经完成，避免重复创建。云端事件删除需连续两轮完整清单缺失且单独 GET 返回 404；请求失败或部分响应不作为删除证据。
+
+默认每轮完成后等待 10 秒，失败退避最多 5 分钟；没有推送订阅或硬实时保证。普通事项全日历读取；原生重复、全天和会议邀请保留在云端而不导入。启用前须阅读 [iCloud 配置及迁移](ICLOUD_SETUP.md)。云端改期通过同一个 store.upsert 导入，因此会更新记忆、scheduleVersion，并取消旧 occurrence 及正在生成的旧提醒。
+
+## DSH hook 与记忆
 
 DSH 插件暴露 Cordis hook：
 

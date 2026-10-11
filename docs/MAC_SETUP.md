@@ -1,5 +1,7 @@
 # macOS 自带日历接入
 
+从 0.2.0 起可使用 [Linux 直连 iCloud](ICLOUD_SETUP.md)，无需运行本页面的 Mac 应用。以下步骤仅用于旧本地后端；启用云端后请退出旧应用。
+
 此应用使用 Apple EventKit，只能在 Mac 运行。当前通过 Git 提供源码和本机构建脚本；已有用户完成构建和连接，最新同步修复仍需实机验收，应用未经过 Apple 签名公证。支持 macOS 14 或更高版本；Apple 芯片和 Intel 均按当前机器架构编译。
 
 1. 如果尚无开发工具，在 Mac 终端运行 `xcode-select --install`，在系统窗口完成安装。

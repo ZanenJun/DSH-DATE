@@ -10,11 +10,17 @@ import { tokenFor, startService } from '../src/service.js';
 import { localClient } from '../src/client.js';
 const { values, positionals } = parseArgs({ allowPositionals: true, options: {
   config: {type:'string'}, owner: {type:'string'}, bot: {type:'string'}, onebot: {type:'string'},
-  port: {type:'string'}, 'dsh-home': {type:'string'}, profile: {type:'string'}, 'show-token': {type:'boolean'}
+  port: {type:'string'}, 'dsh-home': {type:'string'}, profile: {type:'string'}, 'show-token': {type:'boolean'},prefer:{type:'string'}
 } });
 const command = positionals[0]; const configFile = path.resolve(values.config || defaultConfigPath());
 try {
-  if (command === 'init') {
+  if(command==='icloud-setup') {
+    await (await import('./icloud-setup.js')).setupICloud(configFile);
+  } else if(['icloud-status','icloud-sync','icloud-resolve'].includes(command)) {
+    const api=await localClient(configFile);
+    const result=command==='icloud-status'?await api('icloud/status'):command==='icloud-sync'?await api('icloud/sync',{}):await api('icloud/resolve',{id:positionals[1],prefer:values.prefer});
+    console.log(JSON.stringify(result,null,2));
+  } else if (command === 'init') {
     if (!values.owner || !values.bot || !values.onebot) throw Error('init requires --owner QQ --bot QQ --onebot /path/to/onebot_ACCOUNT.json');
     await fs.mkdir(path.dirname(configFile), { recursive:true,mode:0o700 });
     const config = { dataDir:'./data', port:Number(values.port ?? 3217), timeZone:'Asia/Shanghai',repeatMs:30000,
@@ -44,7 +50,7 @@ try {
     console.log(`Installed into profile ${profile}. Restart DSH; select calendar-assistant in qq-bridge. Backup: ${backup}`);
   } else if (command === 'status') {
     const state = await (await localClient(configFile))('state');
-    console.log(JSON.stringify({now:state.now,qqConnected:state.qqConnected,items:state.items.filter(i=>!i.deletedAt).length,activeReminders:state.occurrences.filter(o=>o.state==='active').length},null,2));
+    console.log(JSON.stringify({now:state.now,qqConnected:state.qqConnected,items:state.items.filter(i=>!i.deletedAt).length,activeReminders:state.occurrences.filter(o=>o.state==='active').length,syncBackend:state.syncBackend,icloud:state.icloud},null,2));
   } else if (command === 'pair') {
     const config = await readConfig(configFile);
     console.log(`Mac URL over an SSH tunnel: http://127.0.0.1:${config.port}`);
@@ -54,5 +60,5 @@ try {
     const service = await startService(await readConfig(configFile), {log: m=>console.error(m)});
     console.error(`Calendar service listening on 127.0.0.1:${service.port}`);
     for(const signal of ['SIGINT','SIGTERM']) process.once(signal,async()=>{await service.close();process.exit(0);});
-  } else console.log('dsh-calendar init | install | status | pair [--show-token] | serve\nUse --config PATH to select a configuration. See README.md for installation and Mac pairing.');
+  } else console.log('dsh-calendar init | install | status | icloud-setup | icloud-status | icloud-sync | icloud-resolve ID --prefer local|remote | pair [--show-token] | serve\nUse --config PATH to select a configuration.');
 } catch(e) { console.error(e.message); process.exitCode=1; }

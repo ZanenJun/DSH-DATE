@@ -8,6 +8,9 @@ import { ReminderScheduler } from './scheduler.js';
 import { OneBot } from './onebot.js';
 import { errorStatus, problem, occurrencesBetween } from './model.js';
 import { calendarMemory, localTime } from './memory.js';
+import { ICloudDAV, loadCloudCredentials } from './icloud-dav.js';
+import { ICloudSync } from './icloud-sync.js';
+import { readConfig } from './config.js';
 
 export async function tokenFor(directory) {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -31,7 +34,23 @@ async function body(req) {
 export async function startService(config, options = {}) {
   const store = await new CalendarStore(config.dataDir, { clock: options.clock }).open();
   const diagnostics = { startedAt: new Date().toISOString(), requests: {} };
-  let server, timer, transport, scheduler;
+  let server, timer, transport, scheduler, cloud, cloudTimer, cloudError=null, cloudReloadPromise=null;
+  const cloudStatus=()=>cloud?.status()??{enabled:!!config.icloud?.enabled,lastError:cloudError};
+  const reloadCloud=next=>{
+    if(cloudReloadPromise)throw problem('正在加载 iCloud 配置，请稍后重试',409);
+    cloudReloadPromise=(async()=>{
+    config.icloud=next;
+    await cloud?.close();cloud=null;cloudError=null;
+    if(!next?.enabled)return;
+    try {
+      const dav=options.cloudDAV??new ICloudDAV(await loadCloudCredentials(next.credentialsFile));
+      const candidate=new ICloudSync(store,dav,{...next,timeZone:config.timeZone},{clock:options.clock,log:options.log});
+      try {await candidate.initialize();}catch(e){await candidate.close();throw e;}
+      cloud=candidate;
+    }catch(e){cloudError='iCloud 尚未连接：请检查专用密码文件权限、日历地址及既有绑定';throw e;}
+    })();
+    return cloudReloadPromise.finally(()=>{cloudReloadPromise=null;});
+  };
   try {
     const token = await tokenFor(config.dataDir);
     transport = options.transport ?? new OneBot(config.onebot, e => options.receiveHook ? options.receiveHook(e) : scheduler.receive(e), options.log ?? (() => {}));
@@ -40,7 +59,7 @@ export async function startService(config, options = {}) {
       send: options.sendHook ?? (async () => { throw Error('Reminder delivery requires the DSH Agent plugin'); }), onEvent: options.onEvent
     });
     server = http.createServer(async (req, res) => {
-      const route = ['/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
+      const route = ['/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
       const client = /DSHCalendarSync|CFNetwork|Darwin/i.test(req.headers['user-agent'] ?? '') ? 'mac' : 'other';
       const method = ['GET', 'POST'].includes(req.method) ? req.method : 'other';
       res.on('finish', () => {
@@ -59,14 +78,16 @@ export async function startService(config, options = {}) {
         if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw problem('Unauthorized', 401);
         // This is a local API for MCP / a native Mac app, never a browser origin.
         if (req.headers.origin) throw problem('Browser origins are not supported', 403);
+        if(config.icloud?.enabled && client==='mac')throw problem('已启用 Linux 直连 iCloud。请退出旧 DSH 日历同步程序，使用系统日历的 iCloud 同步。',409);
         const url = new URL(req.url, 'http://127.0.0.1');
         if (req.method === 'GET' && url.pathname === '/v1/diagnostics') return reply(200, diagnostics);
+        if (req.method === 'GET' && url.pathname === '/v1/icloud/status') return reply(200,cloudStatus());
         if (req.method === 'GET' && url.pathname === '/v1/state') {
           const d = store.snapshot();
           return reply(200, { schemaVersion: 1, revision: d.revision,
             now: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).toISO(), timeZone: config.timeZone,
             weekday: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).setLocale('zh-CN').toFormat('cccc'),
-            qqConnected: transport.connected === true,
+            qqConnected: transport.connected === true,syncBackend:config.icloud?.enabled?'icloud':'mac',icloud:cloudStatus(),
             items: Object.values(d.items).map(i => ({ ...i, dueAtLocal: localTime(i.dueAt, i.timeZone) })),
             occurrences: Object.values(d.occurrences).map(o => ({ ...o, dueAtLocal: localTime(o.dueAt, d.items[o.itemId].timeZone) })), memory: calendarMemory(d) });
         }
@@ -89,6 +110,20 @@ export async function startService(config, options = {}) {
         if (req.method === 'POST') {
           const input = await body(req);
           if (!input || typeof input !== 'object' || Array.isArray(input)) throw problem('Expected an object');
+          if(url.pathname==='/v1/icloud/reload') {
+            if(!config.sourceFile)throw problem('当前服务没有配置文件位置',409);
+            const next=await readConfig(config.sourceFile);
+            if(next.dataDir!==config.dataDir || next.port!==config.port)throw problem('端口或数据目录变化需要重启 DSH',409);
+            await reloadCloud(next.icloud);return reply(200,cloudStatus());
+          }
+          if(url.pathname==='/v1/icloud/sync') {
+            if(!cloud)throw problem('iCloud 尚未配置或连接',409);
+            await cloud.tick(true);return reply(200,cloudStatus());
+          }
+          if(url.pathname==='/v1/icloud/resolve') {
+            if(!cloud)throw problem('iCloud 尚未配置或连接',409);
+            await cloud.resolve(input.id,input.prefer);return reply(200,cloudStatus());
+          }
           if (url.pathname === '/v1/reminder-preview') {
             if (!options.previewHook) throw problem('Preview requires the DSH plugin', 503);
             return reply(200, await options.previewHook(input));
@@ -103,17 +138,21 @@ export async function startService(config, options = {}) {
     server.requestTimeout = 15000; server.headersTimeout = 10000;
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
     if (options.startTransport !== false) transport.start();
+    await reloadCloud(config.icloud).catch(()=>options.log?.(cloudError));
+    if(options.startCloudTimer!==false){cloudTimer=setInterval(()=>cloud?.tick().catch(()=>options.log?.('iCloud 同步状态保存失败')),1000);cloudTimer.unref();}
     if (options.startTimer !== false && options.sendHook) {
       timer = setInterval(() => scheduler.tick().catch(() => options.log?.('Calendar tick failed')), 1000);
       timer.unref();
     }
     return { store, scheduler, transport, port: server.address().port,
       async close() {
-        scheduler.stopped = true; clearInterval(timer); transport.close();
+        scheduler.stopped = true; clearInterval(timer);clearInterval(cloudTimer); transport.close();
         await new Promise(resolve => server.close(resolve));
+        await cloudReloadPromise?.catch(()=>{});
+        await cloud?.close();
         while (scheduler.busy) await new Promise(resolve => setTimeout(resolve, 10));
         await store.close();
       }
     };
-  } catch (e) { clearInterval(timer); transport?.close(); server?.close(); await store.close(); throw e; }
+  } catch (e) { clearInterval(timer);clearInterval(cloudTimer);await cloud?.close(); transport?.close(); server?.close(); await store.close(); throw e; }
 }
