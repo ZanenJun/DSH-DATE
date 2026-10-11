@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { localClient } from './client.js';
 import { itemInput } from './model.js';
-const server = new McpServer({ name: 'dsh-calendar-agent', version: '0.1.2' });
+const server = new McpServer({ name: 'dsh-calendar-agent', version: '0.1.3' });
 const call = async (route, args) => {
   try {
     const client = await localClient(process.argv[2]);
@@ -12,7 +12,7 @@ const call = async (route, args) => {
   } catch (e) { return { isError: true, content: [{ type: 'text', text: e.message }] }; }
 };
 server.registerTool('calendar_list', {
-  description: 'Read current local time, all calendar items (including deletion tombstones), revisions and reminder occurrences. Always read before editing or interpreting a relative date. Any QQ reply only acknowledges reminders; it does not complete them.', inputSchema: {}
+  description: 'Read current local time, items, revisions, reminder occurrences and persistent shared calendar memory. dueAt is normalized UTC; dueAtLocal is the SAME instant in timeZone, use it when speaking to the user. Always read before editing or interpreting dates. Any QQ reply only acknowledges reminders; it does not complete them.', inputSchema: {}
 }, () => call('state'));
 server.registerTool('calendar_save', {
   description: 'Create or replace a calendar item. For editing, retain all existing fields and pass its current revision. Dates must include a UTC offset. Habits require daily/weekly recurrence. operationId must be a fresh UUID for each logical edit and reused unchanged on retries.',

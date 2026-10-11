@@ -12,6 +12,10 @@ const localURL = protocol => z.string().url().refine(value => {
 const configSchema = z.object({
   dataDir: z.string().min(1), port: z.number().int().min(0).max(65535).default(3217),
   timeZone: z.string().refine(v => IANAZone.isValidZone(v), 'Invalid time zone').default('Asia/Shanghai'), repeatMs: z.number().int().min(30000).default(30000),
+  reminder: z.object({
+    tone: z.string().min(1).max(1000).default('像熟悉我的日程助理，亲切、简洁，连续未回复时逐渐直接，但不施压或责备。'),
+    timeoutMs: z.number().int().min(1000).max(120000).default(45000)
+  }).default({ tone: '像熟悉我的日程助理，亲切、简洁，连续未回复时逐渐直接，但不施压或责备。', timeoutMs: 45000 }),
   onebot: z.object({
     ownerQQ: z.string().regex(/^\d+$/), botQQ: z.string().regex(/^\d+$/),
     httpUrl: localURL(['http:', 'https:']).default('http://127.0.0.1:3000'),

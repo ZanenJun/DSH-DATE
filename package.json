@@ -1,6 +1,6 @@
 {
   "name": "dsh-calendar-agent",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Private QQ calendar, tasks and habit reminders for DeepSeek Harness, with stdio MCP and macOS Calendar sync",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "test"
   ],
   "scripts": {
-    "test": "node --test",
+    "test": "node --test test/*.test.js",
     "check": "node bin/check.js"
   },
   "dependencies": {
@@ -44,6 +44,7 @@
     "zod": "4.4.3"
   },
   "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
     "@deepseek-ai/dsh-mcp-client": "0.2.0-rc.2"
   },
   "repository": {

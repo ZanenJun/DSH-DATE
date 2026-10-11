@@ -51,3 +51,7 @@ Apple 接口参考：[完整日历访问](https://developer.apple.com/documentat
 先退出旧应用，再使用新源码编译并打开；保留原有 state.json 和钥匙串。修复效果需要在 Mac 上对真实事件验收。
 
 Apple 文档：[日历变化通知与重新获取对象](https://developer.apple.com/documentation/EventKit/updating-with-notifications)、[刷新日历来源](https://developer.apple.com/documentation/eventkit/ekeventstore/refreshsourcesifnecessary())。
+
+## 0.1.3：改期确认与保护本地编辑
+
+上传后显示“服务器已确认：事项 → 日期时间、时区、版本”。请以此确认改期实际上传的值；改到已经过去的时间会生成新的逾期提醒。拉取时跳过无变化的事件，并在写入前刷新检查本地快照：HTTP 请求期间发生的新编辑留到下一轮上传，避免旧响应覆盖它。通过 `bash ~/DSH-DATE/mac/update.sh` 更新后重新开启同步，保持 SSH 隧道运行。

@@ -5,8 +5,8 @@
 <key>CFBundleIdentifier</key><string>org.dsh.calendar-sync</string>
 <key>CFBundleName</key><string>DSH 日历同步</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.2</string>
-<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>0.1.3</string>
+<key>CFBundleVersion</key><string>4</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSCalendarsFullAccessUsageDescription</key><string>同步专用的 DSH 日历助手：显示 QQ 待办和习惯，并将你在该日历中的修改同步回服务器。</string>
 <key>NSCalendarsUsageDescription</key><string>同步 QQ 待办与专用日历。</string>

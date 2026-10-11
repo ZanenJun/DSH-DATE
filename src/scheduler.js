@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { DateTime } from 'luxon';
 import { latestDue, problem } from './model.js';
+import { remember, replyText } from './memory.js';
 
 export class ReminderScheduler {
   constructor(store, { send, clock = Date.now, repeatMs = 30000, ownerQQ, botQQ, onEvent = () => {} }) {
@@ -35,31 +35,39 @@ export class ReminderScheduler {
         const chosen = pending.sort((a, b) => (a.lastAttemptAt ?? -Infinity) - (b.lastAttemptAt ?? -Infinity)).slice(0, 20);
         for (const o of chosen) { o.firstAttemptAt ??= now; o.lastAttemptAt = now; o.attempts++; }
         const deliveryId = randomUUID();
-        const lines = chosen.map(o => {
-          const item = d.items[o.itemId];
-          const time = DateTime.fromISO(o.dueAt).setZone(item.timeZone).toFormat('MM-dd HH:mm');
-          return `• ${item.title}（${time}，${item.id.slice(0, 8)}）`;
-        });
-        return { deliveryId, keys: chosen.map(o => o.key), text: `待办提醒\n${lines.join('\n')}\n回复任意消息暂停本次催促；回复“完成 + 事项”记为完成，“稍后 10 分钟”可延后。` };
+        return { deliveryId, keys: chosen.map(o => o.key), lastReplyId: d.lastReplyId,
+          revisions: Object.fromEntries(chosen.map(o => [o.itemId, d.items[o.itemId].revision])) };
       });
       if (!batch || this.stopped) return;
-      // Reply/delete/snooze may have arrived while the transaction was committing.
-      const fresh = this.store.snapshot();
-      batch.keys = batch.keys.filter(k => fresh.occurrences[k]?.state === 'active');
-      if (!batch.keys.length) return;
-      batch.text = `待办提醒\n${batch.keys.map(k => { const o = fresh.occurrences[k]; const item = fresh.items[o.itemId]; return `• ${item.title}（${DateTime.fromISO(o.dueAt).setZone(item.timeZone).toFormat('MM-dd HH:mm')}，${item.id.slice(0, 8)}）`; }).join('\n')}\n回复任意消息暂停本次催促；回复“完成 + 事项”记为完成，“稍后 10 分钟”可延后。`;
+      // Generation may take seconds. Invalidate the entire draft if any fact changed.
+      batch.isCurrent = () => {
+        const d = this.store.snapshot();
+        return !this.stopped && d.lastReplyId === batch.lastReplyId && batch.keys.every(k => {
+          const o = d.occurrences[k], i = o && d.items[o.itemId];
+          return o?.state === 'active' && i?.enabled && !i.deletedAt && i.status === 'open'
+            && i.revision === batch.revisions[i.id] && (!o.snoozeUntil || this.clock() >= o.snoozeUntil);
+        });
+      };
+      if (!batch.isCurrent()) return;
       try {
         const result = await this.send(batch);
+        if (result?.skipped) return;
+        const sentAt = this.clock();
         await this.store.transact(d => {
+          d.lastDeliveryAt = sentAt;
           for (const key of batch.keys) {
             const o = d.occurrences[key];
-            if (o) { o.lastSentAt = now; o.lastMessageId = result?.message_id ?? null; o.lastError = null; }
+            if (o) { o.lastSentAt = sentAt; o.lastMessageId = result?.message_id ?? null; o.lastError = null;
+              o.sentCount = (o.sentCount ?? 0) + 1; o.lastText = batch.text; }
           }
+          remember(d, { type: 'reminder-sent', keys: batch.keys, text: batch.text,
+            agentSessionId: batch.agentSessionId, messageId: result?.message_id ?? null }, sentAt);
         });
         this.onEvent('reminded', { deliveryId: batch.deliveryId, count: batch.keys.length });
       } catch {
         await this.store.transact(d => {
-          for (const key of batch.keys) if (d.occurrences[key]) d.occurrences[key].lastError = 'QQ send failed; retry at next reminder interval';
+          d.lastDeliveryAt = this.clock();
+          for (const key of batch.keys) if (d.occurrences[key]) d.occurrences[key].lastError = 'Agent generation or QQ delivery failed; retry at next reminder interval';
         });
         this.onEvent('delivery-failed', { deliveryId: batch.deliveryId });
       }
@@ -75,6 +83,8 @@ export class ReminderScheduler {
     const changed = await this.store.transact(d => {
       if (d.seenMessages.includes(id)) return [];
       d.seenMessages.push(id); d.seenMessages = d.seenMessages.slice(-2000);
+      if (at >= (d.lastReplyAt ?? 0)) { d.lastReplyAt = at; d.lastReplyId = id; }
+      remember(d, { type: 'user-reply', text: replyText(event), messageAt: at }, this.clock());
       const keys = [];
       for (const o of Object.values(d.occurrences)) {
         if (o.state === 'active' && o.firstAttemptAt !== null && at >= Math.floor(o.firstAttemptAt / 1000) * 1000) {
@@ -112,6 +122,7 @@ export class ReminderScheduler {
         if (o.state === 'done') throw problem('Completed occurrence cannot be snoozed', 409);
         o.state = 'active'; o.snoozeUntil = now + minutes * 60000; o.lastAttemptAt = null; o.firstAttemptAt = null;
       } else if (o && o.state !== 'done') { o.state = 'acknowledged'; o.acknowledgedAt = now; }
+      remember(d, { type: action, itemId, title: item.title, occurrenceKey: o?.key, minutes }, now);
       return { item, occurrence: o ?? null };
     });
   }

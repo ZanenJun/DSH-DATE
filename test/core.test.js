@@ -9,6 +9,7 @@ import { normalizeItem, occurrencesBetween } from '../src/model.js';
 import { startService, tokenFor } from '../src/service.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { fakeAgents } from './agent-fixture.js';
 
 const epoch = Date.parse('2026-10-11T02:00:00Z');
 const input = (extra = {}) => ({ title: '喝水', dueAt: new Date(epoch).toISOString(), ...extra });
@@ -98,6 +99,8 @@ test('authenticated HTTP API and real stdio MCP client can list/create; browser 
   const added = await client.callTool({ name:'calendar_save', arguments: { id:'mcp-task', item:input() } }); assert.ok(!added.isError, JSON.stringify(added));
   const state = JSON.parse((await client.callTool({ name:'calendar_list',arguments:{} })).content[0].text);
   assert.equal(state.items[0].id, 'mcp-task'); assert.equal(state.qqConnected, true);
+  assert.equal(state.items[0].dueAtLocal, '2026-10-11T10:00:00.000+08:00');
+  assert.equal(state.memory.recentHistory.at(-1).type, 'item-created');
   const bad = await client.callTool({ name:'calendar_save',arguments: { id:'mcp-task',baseRevision:0,item:input() } }); assert.equal(bad.isError,true);
 });
 test('latest due is consistent with enumeration across intervals, weekdays, ending rules and DST', async () => {
@@ -129,7 +132,7 @@ test('plugin lifecycle hooks deliver through OneBot HTTP and acknowledge through
   const wss = new WebSocketServer({server:onebot}); let socket;
   wss.on('connection',ws=>socket=ws);
   const handlers=new Map(),disposers=[],seen=[];
-  const ctx={ on(n,fn){handlers.set(n,fn);},async parallel(n,x){seen.push(n);return handlers.get(n)?.(x);},emit(n){seen.push(n);},effect(fn){disposers.push(fn());},logger:{info(){},warn(){}} };
+  const ctx={ ...fakeAgents(), on(n,fn){handlers.set(n,fn);},async parallel(n,x){seen.push(n);return handlers.get(n)?.(x);},emit(n){seen.push(n);},effect(fn){disposers.push(fn());},logger:{info(){},warn(){}} };
   t.after(async()=>{for(const dispose of disposers)await dispose();wss.close();await new Promise(r=>onebot.close(r));await fs.rm(dir,{recursive:true,force:true});});
   await fs.writeFile(path.join(dir,'token'),'test-token');
   const cfg=path.join(dir,'config.json');
@@ -138,9 +141,11 @@ test('plugin lifecycle hooks deliver through OneBot HTTP and acknowledge through
   const waitFor=async predicate=>{const until=Date.now()+8000;while(!await predicate()){if(Date.now()>until)throw Error('timed out');await new Promise(r=>setTimeout(r,30));}};
   await waitFor(()=>socket);
   // Exercise plugin hooks with mock OneBot endpoints; never contact real QQ.
-  const batch={deliveryId:'test',keys:[],text:'test reminder'};
+  const batch={deliveryId:'test',keys:[],isCurrent:()=>true};
   await ctx.parallel('calendar-agent/reminder-due',batch);
   assert.equal(sent.length,1);assert.equal(sent[0].user_id,123);assert.equal(batch.result.message_id,12);
+  assert.equal(ctx.calls.length,1); assert.equal(ctx.calls[0].source.kind,'calendar-reminder');
+  assert.equal(sent[0].message[0].data.text,'该喝水了，先拿起水杯喝几口吧。');
   socket.send(JSON.stringify({post_type:'message',message_type:'private',self_id:456,user_id:123,message_id:13,time:Math.floor(Date.now()/1000)}));
   await waitFor(async()=>JSON.parse(await fs.readFile(path.join(dir,'calendar.json'),'utf8')).seenMessages.length===1);
   assert.ok(seen.includes('calendar-agent/message'));

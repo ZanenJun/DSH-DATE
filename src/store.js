@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { normalizeItem, editable, problem } from './model.js';
+import { remember } from './memory.js';
 
 export async function atomicJSON(file, data) {
   const tmp = `${file}.${randomUUID()}.tmp`;
@@ -88,6 +89,8 @@ export class CalendarStore {
       const scheduleChanged = old && (['dueAt', 'timeZone', 'recurrence'].some(k => JSON.stringify(old[k]) !== JSON.stringify(next[k])) || (!old.enabled && next.enabled) || (old.status !== 'open' && next.status === 'open'));
       next.scheduleVersion = (old?.scheduleVersion ?? 1) + (scheduleChanged ? 1 : 0);
       d.items[id] = next;
+      remember(d, { type: old ? 'item-updated' : 'item-created', itemId: id, title: next.title,
+        dueAt: next.dueAt, previousDueAt: old?.dueAt, timeZone: next.timeZone, revision: next.revision }, this.clock());
       for (const occurrence of Object.values(d.occurrences)) {
         if (occurrence.itemId === id && ['active', 'acknowledged'].includes(occurrence.state) && (scheduleChanged || !next.enabled || next.status !== 'open')) occurrence.state = 'cancelled';
       }
@@ -107,6 +110,7 @@ export class CalendarStore {
       if (!item) throw problem('Item not found', 404);
       if (item.revision !== baseRevision) throw problem('Revision conflict: reload before deleting', 409);
       item.deletedAt = new Date(this.clock()).toISOString(); item.updatedAt = item.deletedAt; item.revision++;
+      remember(d, { type: 'item-deleted', itemId: id, title: item.title }, this.clock());
       for (const o of Object.values(d.occurrences)) if (o.itemId === id && ['active', 'acknowledged'].includes(o.state)) o.state = 'cancelled';
       d.receipts[operationId] = { fingerprint, result: structuredClone(item) };
       return item;

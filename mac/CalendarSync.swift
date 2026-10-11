@@ -70,7 +70,7 @@ struct APIError: Error { let status: Int; let message: String }
               base.user == nil, base.password == nil, base.query == nil, base.fragment == nil else { throw failure("使用 HTTPS 地址或 SSH 隧道的本地地址") }
         var r = URLRequest(url: base.appendingPathComponent("v1/" + route)); r.timeoutInterval = 15
         r.setValue("Bearer " + savedToken, forHTTPHeaderField: "Authorization")
-        r.setValue("DSHCalendarSync/0.1.2", forHTTPHeaderField: "User-Agent")
+        r.setValue("DSHCalendarSync/0.1.3", forHTTPHeaderField: "User-Agent")
         if let body = body { r.httpMethod = "POST"; r.httpBody = try json(body); r.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let (data, response) = try await URLSession.shared.data(for: r)
         guard let response = response as? HTTPURLResponse else { throw failure("服务器未响应") }
@@ -161,7 +161,14 @@ struct APIError: Error { let status: Int; let message: String }
             uploadsThisCycle += 1
             var maps = state["maps"] as? Object ?? [:]; var map = op["map"] as? Object ?? [:]
             if route == "delete" { maps.removeValue(forKey: id) }
-            else { map["revision"] = result["revision"]; maps[id] = map }
+            else {
+                map["revision"] = result["revision"]; maps[id] = map
+                if let due = try? date(result["dueAt"]) {
+                    let format = DateFormatter(); format.dateFormat = "yyyy-MM-dd HH:mm zzz"
+                    format.timeZone = TimeZone(identifier: result["timeZone"] as? String ?? "Asia/Shanghai")
+                    state["lastUpload"] = "服务器已确认：\(result["title"] as? String ?? "事项") → \(format.string(from: due))（版本 \(result["revision"] as? Int ?? 0)）"
+                }
+            }
             state["maps"] = maps; pending.removeValue(forKey: id); state["pending"] = pending; try persist()
             return result
         } catch let error as APIError where error.status == 409 {
@@ -258,7 +265,16 @@ struct APIError: Error { let status: Int; let message: String }
                     maps.removeValue(forKey: id); continue
                 }
                 if let map = map, (map["missing"] as? Int ?? 0) > 0 { continue }
-                let e = map.flatMap { event($0, in: c) } ?? EKEvent(eventStore: store); e.calendar = c
+                let existing = map.flatMap { event($0, in: c) }
+                if let existing = existing, let map = map {
+                    // Edits may arrive while an HTTP upload/pull is suspended. Never overwrite them.
+                    guard existing.refresh() else { throw failure("日历事件在同步中发生变化，下一轮重试。") }
+                    if !same(snapshot(existing), map["snapshot"] as? Object ?? [:]) { continue }
+                    // Avoid rewriting unchanged EventKit objects every ten seconds.
+                    if map["revision"] as? Int == item["revision"] as? Int,
+                       existing.url?.scheme == "dshcalendar", existing.url?.host == "item" { continue }
+                }
+                let e = existing ?? EKEvent(eventStore: store); e.calendar = c
                 try fill(e, from: item, id: id); try store.save(e, span: .thisEvent, commit: true)
                 maps[id] = ["eventId": e.eventIdentifier ?? "", "revision": item["revision"] ?? 0, "snapshot": snapshot(e), "missing": 0]
                 state["maps"] = maps; try persist()
@@ -280,6 +296,7 @@ struct APIError: Error { let status: Int; let message: String }
             state["projections"] = projectionMaps; try persist()
             conflictCount = (state["conflicts"] as? Object ?? [:]).count
             details += "\n本轮成功上传 \(uploadsThisCycle) 次。"
+            if let confirmed = state["lastUpload"] as? String { details += "\n" + confirmed }
             if found.isEmpty { details += "\n当前绑定的日历没有读到事件；请核对事件所在日历和账户。" }
             if duplicateCalendars > 0 { details += "\n另有 \(duplicateCalendars) 本同名日历，程序仅同步已绑定的这一本。" }
             if orphaned > 0 { details += "\n\(orphaned) 项带有旧同步标记，但服务器没有对应记录，已保留待排查。" }
@@ -335,7 +352,7 @@ struct APIError: Error { let status: Int; let message: String }
                 if model.conflictCount > 0 {
                     Button("保留本地副本，并采用服务器版本") { Task { await model.resolveConflicts() } }.disabled(model.busy || model.starting)
                 }
-                Text("0.1.2 · 每 10 秒同步一次；QQ 到点提醒及 30 秒催促由服务器持续运行。请勿在专用日历中创建全天或重复事件。")
+                Text("0.1.3 · 每 10 秒同步一次；QQ 到点提醒及 30 秒催促由服务器持续运行。请勿在专用日历中创建全天或重复事件。")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }.padding(24).frame(width: 530)

@@ -7,6 +7,7 @@ import { CalendarStore } from './store.js';
 import { ReminderScheduler } from './scheduler.js';
 import { OneBot } from './onebot.js';
 import { errorStatus, problem, occurrencesBetween } from './model.js';
+import { calendarMemory, localTime } from './memory.js';
 
 export async function tokenFor(directory) {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -36,10 +37,10 @@ export async function startService(config, options = {}) {
     transport = options.transport ?? new OneBot(config.onebot, e => options.receiveHook ? options.receiveHook(e) : scheduler.receive(e), options.log ?? (() => {}));
     scheduler = new ReminderScheduler(store, {
       clock: options.clock, repeatMs: config.repeatMs, ...config.onebot,
-      send: options.sendHook ?? (batch => transport.send(batch)), onEvent: options.onEvent
+      send: options.sendHook ?? (async () => { throw Error('Reminder delivery requires the DSH Agent plugin'); }), onEvent: options.onEvent
     });
     server = http.createServer(async (req, res) => {
-      const route = ['/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
+      const route = ['/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
       const client = /DSHCalendarSync|CFNetwork|Darwin/i.test(req.headers['user-agent'] ?? '') ? 'mac' : 'other';
       const method = ['GET', 'POST'].includes(req.method) ? req.method : 'other';
       res.on('finish', () => {
@@ -65,7 +66,9 @@ export async function startService(config, options = {}) {
           return reply(200, { schemaVersion: 1, revision: d.revision,
             now: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).toISO(), timeZone: config.timeZone,
             weekday: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).setLocale('zh-CN').toFormat('cccc'),
-            qqConnected: transport.connected === true, items: Object.values(d.items), occurrences: Object.values(d.occurrences) });
+            qqConnected: transport.connected === true,
+            items: Object.values(d.items).map(i => ({ ...i, dueAtLocal: localTime(i.dueAt, i.timeZone) })),
+            occurrences: Object.values(d.occurrences).map(o => ({ ...o, dueAtLocal: localTime(o.dueAt, d.items[o.itemId].timeZone) })), memory: calendarMemory(d) });
         }
         if (req.method === 'GET' && url.pathname === '/v1/projections') {
           const now = options.clock?.() ?? Date.now();
@@ -86,6 +89,10 @@ export async function startService(config, options = {}) {
         if (req.method === 'POST') {
           const input = await body(req);
           if (!input || typeof input !== 'object' || Array.isArray(input)) throw problem('Expected an object');
+          if (url.pathname === '/v1/reminder-preview') {
+            if (!options.previewHook) throw problem('Preview requires the DSH plugin', 503);
+            return reply(200, await options.previewHook(input));
+          }
           if (url.pathname === '/v1/upsert') return reply(200, await store.upsert(input));
           if (url.pathname === '/v1/delete') return reply(200, await store.remove(input));
           if (url.pathname === '/v1/action') return reply(200, await scheduler.act(input));
@@ -96,7 +103,7 @@ export async function startService(config, options = {}) {
     server.requestTimeout = 15000; server.headersTimeout = 10000;
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
     if (options.startTransport !== false) transport.start();
-    if (options.startTimer !== false) {
+    if (options.startTimer !== false && options.sendHook) {
       timer = setInterval(() => scheduler.tick().catch(() => options.log?.('Calendar tick failed')), 1000);
       timer.unref();
     }
