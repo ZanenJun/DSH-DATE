@@ -10,6 +10,7 @@ import { startService, tokenFor } from '../src/service.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { fakeAgents } from './agent-fixture.js';
+import {readStorageSync} from '../src/storage-layout.js';
 
 const epoch = Date.parse('2026-10-11T02:00:00Z');
 const input = (extra = {}) => ({ title: '喝水', dueAt: new Date(epoch).toISOString(), ...extra });
@@ -147,7 +148,7 @@ test('plugin lifecycle hooks deliver through OneBot HTTP and acknowledge through
   assert.equal(ctx.calls.length,1); assert.equal(ctx.calls[0].source.kind,'calendar-reminder');
   assert.equal(sent[0].message[0].data.text,'该喝水了，先拿起水杯喝几口吧。');
   socket.send(JSON.stringify({post_type:'message',message_type:'private',self_id:456,user_id:123,message_id:13,time:Math.floor(Date.now()/1000)}));
-  await waitFor(async()=>JSON.parse(await fs.readFile(path.join(dir,'calendar.json'),'utf8')).seenMessages.length===1);
+  await waitFor(async()=>readStorageSync(dir).data.seenMessages.length===1);
   assert.ok(seen.includes('calendar-agent/message'));
 });
 

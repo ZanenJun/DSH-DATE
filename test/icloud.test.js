@@ -10,13 +10,14 @@ import {ICloudDAV,appleURL,loadCloudCredentials,cloudFailureMessage} from '../sr
 import {encodeEvent,parseEvent,fieldsFor} from '../src/icloud-codec.js';
 import {startService,tokenFor} from '../src/service.js';
 import {readConfig} from '../src/config.js';
+import {syncWindow,withinWindow} from '../src/sync-window.js';
 
 const base='https://p12-caldav.icloud.com/123/calendars/dsh/';
 const at=Date.parse('2026-10-11T07:00:00Z');
 const item=(extra={})=>({title:'学习',notes:'',dueAt:new Date(at).toISOString(),durationMinutes:30,timeZone:'Asia/Shanghai',...extra});
 class FakeDAV {
   credentials={username:'test@example.com'};objects=new Map();puts=0;deletes=0;version=0;
-  async list(){if(this.listFailure)throw Error('offline');return [...this.objects.values()].map(x=>({...x}));}
+  async list(url,window){this.lastWindow=window;if(this.listFailure)throw Error('offline');return [...this.objects.values()].filter(x=>{const event=parseEvent(x.raw);return !window || event.unsupported || withinWindow(event.fields,window);}).map(x=>({...x}));}
   async get(href){return this.objects.get(href)??null;}
   async put(href,raw,etag){
     const old=this.objects.get(href);if((old?.etag??null)!==etag)throw Object.assign(Error('CAS'),{status:409});
@@ -30,11 +31,12 @@ class FakeDAV {
 }
 async function fixture(t){
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'icloud-sync-test-'));
-  const store=await new CalendarStore(dir,{clock:()=>at}).open(),dav=new FakeDAV();
+  let now=at;const clock=()=>now;
+  const store=await new CalendarStore(dir,{clock}).open(),dav=new FakeDAV();
   const config={calendarUrl:base,intervalMs:10000,timeZone:'Asia/Shanghai'};
-  let sync=new ICloudSync(store,dav,config,{clock:()=>at});await sync.initialize();
+  let sync=new ICloudSync(store,dav,config,{clock});await sync.initialize();
   t.after(async()=>{await sync.close();await store.close();await fs.rm(dir,{recursive:true,force:true});});
-  return {store,dav,sync,dir,async restart(){await sync.close();await store.close();await store.open();sync=new ICloudSync(store,dav,config,{clock:()=>at});await sync.initialize();return sync;}};
+  return {store,dav,sync,dir,setNow(value){now=value;},async restart(){await sync.close();await store.close();await store.open();sync=new ICloudSync(store,dav,config,{clock});await sync.initialize();return sync;}};
 }
 test('CalDAV codec round-trips escaped text and preserves unrelated event properties',()=>{
   const values=item({title:'会议,准备;\n材料',notes:'备注\\换行\n第二行'});
@@ -94,11 +96,11 @@ test('migration adopts old Mac URL mapping rather than duplicating an event',asy
   await s.sync.tick(true);assert.equal(Object.keys(s.store.snapshot().items).length,1);assert.equal(s.dav.puts,0);
   assert.equal(s.sync.status().mapped,1);
 });
-test('unsupported events stay intact; supported items sync across the full calendar, including future years',async t=>{
+test('unsupported events and future years stay in iCloud without importing outside the window',async t=>{
   const s=await fixture(t),href=s.dav.seed('repeating',item());let o=s.dav.objects.get(href);
   s.dav.objects.set(href,{...o,raw:o.raw.replace('END:VEVENT','RRULE:FREQ=DAILY\r\nEND:VEVENT')});
   s.dav.seed('future',item({dueAt:'2036-10-11T07:00:00.000Z'}));await s.sync.tick(true);
-  assert.equal(Object.keys(s.store.snapshot().items).length,1);assert.equal(s.sync.status().unsupported,1);assert.equal(s.dav.objects.size,2);
+  assert.equal(Object.keys(s.store.snapshot().items).length,0);assert.equal(s.sync.status().unsupported,1);assert.equal(s.dav.objects.size,2);
 });
 test('habit projections stay one-way and completed occurrences are reflected without creating todos',async t=>{
   const s=await fixture(t);await s.store.upsert({id:'habit',item:{...item(),kind:'habit',recurrence:{frequency:'daily',until:new Date(at+86400000).toISOString()}}});
@@ -148,7 +150,7 @@ test('Apple collection metadata is ignored while actual event failures still sto
 test('cloud mode rejects the legacy Mac writer and exposes status through authenticated API',async t=>{
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'icloud-service-test-')),dav=new FakeDAV();
   const svc=await startService({dataDir:dir,port:0,timeZone:'Asia/Shanghai',onebot:{},icloud:{enabled:true,calendarUrl:base,intervalMs:10000}},
-    {cloudDAV:dav,startCloudTimer:false,startTimer:false,startTransport:false,transport:{close(){}}});
+    {clock:()=>at,cloudDAV:dav,startCloudTimer:false,startTimer:false,startTransport:false,transport:{close(){}}});
   t.after(async()=>{await svc.close();await fs.rm(dir,{recursive:true,force:true});});
   const url=`http://127.0.0.1:${svc.port}/v1/`,token=await tokenFor(dir);
   const headers={Authorization:`Bearer ${token}`};
@@ -161,7 +163,7 @@ test('cloud mode rejects the legacy Mac writer and exposes status through authen
 test('save receipts distinguish local storage, verified iCloud revisions, and sync errors',async t=>{
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'icloud-receipt-test-')),dav=new FakeDAV();
   const svc=await startService({dataDir:dir,port:0,timeZone:'Asia/Shanghai',onebot:{},icloud:{enabled:true,calendarUrl:base,intervalMs:10000}},
-    {cloudDAV:dav,startCloudTimer:false,startTimer:false,startTransport:false,transport:{close(){}}});
+    {clock:()=>at,cloudDAV:dav,startCloudTimer:false,startTimer:false,startTransport:false,transport:{close(){}}});
   t.after(async()=>{await svc.close();await fs.rm(dir,{recursive:true,force:true});});
   const url=`http://127.0.0.1:${svc.port}/v1/`,headers={Authorization:`Bearer ${await tokenFor(dir)}`};
   const post=async(route,input)=>(await fetch(url+route,{method:'POST',headers,body:JSON.stringify(input)})).json();
@@ -242,7 +244,7 @@ test('running service reloads cloud configuration without opening a second store
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'icloud-reload-test-')),dav=new FakeDAV(),file=path.join(dir,'config.json');
   const config={dataDir:'./data',port:0,timeZone:'Asia/Shanghai',onebot:{ownerQQ:'1',botQQ:'2',configFile:'./onebot.json'}};
   await fs.writeFile(file,JSON.stringify(config));
-  const svc=await startService(await readConfig(file),{cloudDAV:dav,startCloudTimer:false,startTimer:false,startTransport:false,transport:{close(){}}});
+  const svc=await startService(await readConfig(file),{clock:()=>at,cloudDAV:dav,startCloudTimer:false,startTimer:false,startTransport:false,transport:{close(){}}});
   t.after(async()=>{await svc.close();await fs.rm(dir,{recursive:true,force:true});});
   const headers={Authorization:`Bearer ${await tokenFor(path.join(dir,'data'))}`},url=`http://127.0.0.1:${svc.port}/v1/`;
   assert.equal((await(await fetch(url+'state',{headers})).json()).syncBackend,'mac');
@@ -277,4 +279,52 @@ test('setup diagnostics separate DNS, timeouts, TLS, forbidden endpoints and DAV
   const malformed=new ICloudDAV({username:'private',password:'private'},{fetchImpl:async()=>new Response('<html>private response</html>',{status:200})});
   await assert.rejects(malformed.discover());const message=cloudFailureMessage(malformed.diagnostic);
   assert.match(message,/未能解析或发现/);assert.match(message,/HTTP 200/);assert.doesNotMatch(message,/private/);
+});
+
+test('only previous, current and next month are imported or exported',async t=>{
+  const s=await fixture(t);
+  await s.store.upsert({id:'archive',item:item({dueAt:'2026-08-10T00:00:00.000Z'})});
+  await s.store.upsert({id:'future',item:item({dueAt:'2026-12-10T00:00:00.000Z'})});
+  s.dav.seed('previous',item({dueAt:'2026-09-10T00:00:00.000Z'}));s.dav.seed('next',item({dueAt:'2026-11-10T00:00:00.000Z'}));
+  s.dav.seed('outside',item({dueAt:'2026-12-10T00:00:00.000Z'}));
+  await s.sync.tick(true);assert.deepEqual(s.dav.lastWindow.months,['2026-09','2026-10','2026-11']);
+  assert.equal(Object.keys(s.store.snapshot().items).length,4);assert.equal(s.dav.puts,0);assert.equal(s.sync.status().mapped,2);
+});
+test('remote and local moves out of the window propagate once without being treated as deletion',async t=>{
+  const s=await fixture(t),href=s.dav.seed('boundary',item());await s.sync.tick(true);
+  const id=Object.keys(s.store.snapshot().items)[0];s.dav.edit(href,{dueAt:'2026-12-11T07:00:00.000Z'});
+  await s.sync.tick(true);let saved=s.store.snapshot().items[id];assert.equal(saved.dueAt,'2026-12-11T07:00:00.000Z');assert.equal(saved.deletedAt,null);
+  const get=s.dav.get.bind(s.dav);let reads=0;s.dav.get=async(...args)=>{reads++;return get(...args);};
+  await s.sync.tick(true);assert.equal(reads,0);assert.equal(s.dav.deletes,0);
+  await s.store.upsert({id,baseRevision:saved.revision,item:item()});await s.sync.tick(true);
+  saved=s.store.snapshot().items[id];await s.store.upsert({id,baseRevision:saved.revision,item:item({dueAt:'2026-12-15T07:00:00.000Z'})});
+  await s.sync.tick(true);assert.equal(parseEvent((await get(href)).raw).fields.dueAt,'2026-12-15T07:00:00.000Z');
+  const puts=s.dav.puts;await s.sync.tick(true);assert.equal(s.dav.puts,puts);assert.equal(s.sync.status().conflicts.length,0);
+});
+test('month rollover archives earlier events without deleting either copy and imports the newly included month',async t=>{
+  const s=await fixture(t),old=s.dav.seed('old',item({dueAt:'2026-09-11T07:00:00.000Z'}));
+  s.dav.seed('december',item({dueAt:'2026-12-11T07:00:00.000Z'}));await s.sync.tick(true);
+  const id=Object.keys(s.store.snapshot().items)[0];s.setNow(Date.parse('2026-11-01T00:00:00Z'));
+  s.dav.edit(old,{title:'archived cloud edit'});await s.sync.tick(true);await s.sync.tick(true);
+  assert.equal(s.store.snapshot().items[id].title,'学习');assert.equal(s.store.snapshot().items[id].deletedAt,null);
+  assert.equal(Object.keys(s.store.snapshot().items).length,2);assert.equal(s.dav.deletes,0);assert.equal(s.dav.objects.size,2);
+});
+test('old habit rules generate only window projections and rolling out does not delete cloud history',async t=>{
+  const s=await fixture(t);await s.store.upsert({id:'old-rule',item:item({dueAt:'2026-06-01T07:00:00.000Z',kind:'habit',recurrence:{frequency:'weekly',weekdays:[1]}})});
+  await s.sync.tick(true);assert.ok(s.dav.objects.size>0);
+  for(const o of s.dav.objects.values())assert.ok(withinWindow(parseEvent(o.raw).fields,s.sync.window()));
+  const count=s.dav.objects.size;s.setNow(Date.parse('2026-11-01T00:00:00Z'));await s.sync.tick(true);
+  assert.ok(s.dav.objects.size>count);assert.equal(s.dav.deletes,0);
+});
+test('CalDAV REPORT actually sends the bounded UTC time-range',async()=>{
+  let sent;
+  const dav=new ICloudDAV({username:'test',password:'test'},{fetchImpl:async(url,init)=>{sent=init.body;return new Response('<d:multistatus xmlns:d="DAV:"/>',{status:207,headers:{'content-type':'application/xml'}});}});
+  await dav.list(base,syncWindow(at));assert.match(sent,/start="20260831T160000Z"/);assert.match(sent,/end="20261130T160000Z"/);
+});
+
+test('persisted retry outside the rolling window is retained but not sent or counted as active pending',async t=>{
+  const s=await fixture(t);await s.store.upsert({id:'old-pending',item:item({dueAt:'2026-09-11T07:00:00.000Z'})});
+  s.dav.loseResponse=true;await s.sync.tick(true);assert.equal(s.sync.status().pending,1);
+  s.setNow(Date.parse('2026-11-01T00:00:00Z'));let reads=0;const get=s.dav.get.bind(s.dav);s.dav.get=async(...args)=>{reads++;return get(...args);};
+  await s.sync.tick(true);assert.equal(reads,0);assert.equal(s.sync.status().pending,0);assert.equal(s.sync.status().deferredPending,1);assert.equal(s.dav.puts,1);
 });

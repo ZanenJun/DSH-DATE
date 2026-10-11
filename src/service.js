@@ -12,6 +12,7 @@ import { ICloudDAV, loadCloudCredentials } from './icloud-dav.js';
 import { ICloudSync } from './icloud-sync.js';
 import { readConfig } from './config.js';
 import { itemSyncStatus } from './sync-status.js';
+import {syncWindow} from './sync-window.js';
 
 export async function tokenFor(directory) {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -33,11 +34,11 @@ async function body(req) {
   catch { throw problem('Expected a JSON body'); }
 }
 export async function startService(config, options = {}) {
-  const store = await new CalendarStore(config.dataDir, { clock: options.clock }).open();
+  const store = await new CalendarStore(config.dataDir, { clock: options.clock,timeZone:config.timeZone }).open();
   const diagnostics = { startedAt: new Date().toISOString(), requests: {} };
   let server, timer, transport, scheduler, cloud, cloudTimer, cloudError=null, cloudReloadPromise=null;
   const cloudStatus=()=>cloud?.status()??{enabled:!!config.icloud?.enabled,lastError:cloudError};
-  const syncFor=(item,data=store.snapshot())=>itemSyncStatus(item,data,{enabled:!!config.icloud?.enabled,available:!!cloud,error:cloudError});
+  const syncFor=(item,data=store.snapshot())=>itemSyncStatus(item,data,{enabled:!!config.icloud?.enabled,available:!!cloud,error:cloudError,now:options.clock?.()??Date.now(),timeZone:config.timeZone});
   const reloadCloud=next=>{
     if(cloudReloadPromise)throw problem('正在加载 iCloud 配置，请稍后重试',409);
     cloudReloadPromise=(async()=>{
@@ -89,14 +90,15 @@ export async function startService(config, options = {}) {
           return reply(200, { schemaVersion: 1, revision: d.revision,
             now: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).toISO(), timeZone: config.timeZone,
             weekday: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).setLocale('zh-CN').toFormat('cccc'),
-            qqConnected: transport.connected === true,syncBackend:config.icloud?.enabled?'icloud':'mac',icloud:cloudStatus(),
+            qqConnected: transport.connected === true,syncBackend:config.icloud?.enabled?'icloud':'mac',icloud:cloudStatus(),syncWindow:syncWindow(options.clock?.()??Date.now(),config.timeZone),
             items: Object.values(d.items).map(i => ({ ...i, dueAtLocal: localTime(i.dueAt, i.timeZone),sync:syncFor(i,d) })),
             occurrences: Object.values(d.occurrences).map(o => ({ ...o, dueAtLocal: localTime(o.dueAt, d.items[o.itemId].timeZone) })), memory: calendarMemory(d) });
         }
         if (req.method === 'GET' && url.pathname === '/v1/projections') {
           const now = options.clock?.() ?? Date.now();
-          const from = url.searchParams.has('from') ? Date.parse(url.searchParams.get('from')) : now - 7 * 86400000;
-          const to = url.searchParams.has('to') ? Date.parse(url.searchParams.get('to')) : now + 90 * 86400000;
+          const window=syncWindow(now,config.timeZone);
+          const from = url.searchParams.has('from') ? Date.parse(url.searchParams.get('from')) : window.from;
+          const to = url.searchParams.has('to') ? Date.parse(url.searchParams.get('to')) : window.to-1;
           if (!Number.isFinite(from) || !Number.isFinite(to) || to < from || to - from > 366 * 86400000) throw problem('Projection range must be <= 366 days');
           const d = store.snapshot(); const events = [];
           for (const item of Object.values(d.items)) {

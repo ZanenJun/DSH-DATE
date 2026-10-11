@@ -1,6 +1,6 @@
 # 数据、同步与 hook
 
-`calendar.json` schemaVersion 为 1。`items` 是按 ID 索引的对象，每项拥有 `revision`（从 1 开始）、`scheduleVersion`、`createdAt`、`updatedAt`、`deletedAt` 和可编辑字段：
+磁盘 `calendar.json` 的 schemaVersion 为 2，只保存月份索引；每月 `calendar/YYYY-MM.json` 包含 items 和 occurrences。HTTP/内存兼容结构仍为 schemaVersion 1。`items` 是按 ID 索引的对象，每项拥有 `revision`（从 1 开始）、`scheduleVersion`、`createdAt`、`updatedAt`、`deletedAt` 和可编辑字段：
 
 ```json
 {
@@ -29,7 +29,7 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 | POST /v1/upsert | `{id, baseRevision, operationId, item}`；创建使用新 ID 与 baseRevision=0，编辑必须保留全部可编辑字段；返回保存事项及当前 sync 状态 |
 | POST /v1/delete | `{id, baseRevision, operationId}`；保存删除记录，取消对应催促 |
 | POST /v1/action | `{action: "complete" 或 "snooze" 或 "acknowledge", itemId, occurrenceKey?, minutes?}` |
-| GET /v1/projections | 习惯展开数组；默认过去 7 天到未来 90 天；可传 from/to ISO 日期，最大跨度 366 天 |
+| GET /v1/projections | 习惯展开数组；默认上个月、本月和下个月；可传 from/to ISO 日期，最大跨度 366 天 |
 | GET /v1/icloud/status | enabled、running、lastSyncAt、lastError、pending、mapped、unsupported、conflicts |
 | POST /v1/icloud/reload | `{}`；重新读取配置文件的 icloud 段；端口或 dataDir 变化须重启 |
 | POST /v1/icloud/sync | `{}`；等待一轮手动同步，返回状态；HTTP 200 后仍须检查 lastError/conflicts |
@@ -41,13 +41,15 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 
 ## iCloud 同步状态（0.2.0）
 
-`syncClients.icloud` 保存账户摘要与日历 URL 绑定、`maps`（UID/href/ETag/本地 revision/最后共同字段）、`pending`（发出前持久化的请求）、`conflicts`（冲突原因及远端副本）和最近状态。不含 Apple 密码；凭据独立保存于权限 600 的文件。导入事项和对应映射在同一存储事务提交。
+`state.json` 内的 `syncClients.icloud` 保存账户摘要与日历 URL 绑定、`maps`（UID/href/ETag/本地 revision/最后共同字段）、`pending`（发出前持久化的请求）、`conflicts`（冲突原因及远端副本）和最近状态。不含 Apple 密码；凭据独立保存于权限 600 的文件。导入事项和对应映射在同一存储事务提交。
 
-单个同步循环串行执行：重试 pending → 全量 VEVENT REPORT → 比较共同字段及本地 revision → 导入/排队写入 → 更新习惯投影 → 发出条件请求。PUT 创建用 If-None-Match: *，更新/删除用 If-Match: ETag；写入后 GET 校验。收到响应前崩溃时，下轮按 UID 与内容核验是否已经完成，避免重复创建。云端事件删除需连续两轮完整清单缺失且单独 GET 返回 404；请求失败或部分响应不作为删除证据。
+单个同步循环串行执行：重试 pending → 三个月窗口的 VEVENT REPORT → 比较共同字段及本地 revision → 导入/排队写入 → 更新习惯投影 → 发出条件请求。PUT 创建用 If-None-Match: *，更新/删除用 If-Match: ETag；写入后 GET 校验。收到响应前崩溃时，下轮按 UID 与内容核验是否已经完成，避免重复创建。云端事件删除需连续两轮完整清单缺失且单独 GET 返回 404；请求失败或部分响应不作为删除证据。
 
-默认每轮完成后等待 10 秒，失败退避最多 5 分钟；没有推送订阅或硬实时保证。普通事项全日历读取；原生重复、全天和会议邀请保留在云端而不导入。启用前须阅读 [iCloud 配置及迁移](ICLOUD_SETUP.md)。云端改期通过同一个 store.upsert 导入，因此会更新记忆、scheduleVersion，并取消旧 occurrence 及正在生成的旧提醒。
+默认每轮完成后等待 10 秒，失败退避最多 5 分钟；没有推送订阅或硬实时保证。普通事项在上个月、本月、下个月的窗口读取；原生重复、全天和会议邀请保留在云端而不导入。启用前须阅读 [iCloud 配置及迁移](ICLOUD_SETUP.md)。云端改期通过同一个 store.upsert 导入，因此会更新记忆、scheduleVersion，并取消旧 occurrence 及正在生成的旧提醒。
 
-事项返回的 `sync.state` 为 pending / synced / error / conflict / projection / unverified。普通事项仅在 iCloud 映射已读回确认同一个 revision、没有待发送/缺失/冲突且同步服务状态正常时返回 synced；这个状态不代表设备端已刷新。upsert 的成功只保证 Linux 保存成功，回复用户应依据 sync 状态，不能把 pending 或 error 称为“已同步”。习惯多投影与旧 Mac 后端暂不提供逐版本云端确认。`sync`、`dueAtLocal` 都是只读字段，不要传进保存请求的 item；幂等重试保留原保存结果，其 sync 状态按查询时现状计算。
+`syncWindow` 返回范围的时区、三个自然月、起点（含）和终点（不含）。窗口滚动不等于删除；已知事件消失需读取确认是否跨出边界，跨界改期完成一次后停止跟踪。未来/过去归档事项不自动同步。
+
+事项返回的 `sync.state` 为 pending / synced / error / conflict / projection / unverified / archived。普通事项仅在 iCloud 映射已读回确认同一个 revision、没有待发送/缺失/冲突且同步服务状态正常时返回 synced；这个状态不代表设备端已刷新。upsert 的成功只保证 Linux 保存成功，回复用户应依据 sync 状态，不能把 pending 或 error 称为“已同步”。习惯多投影与旧 Mac 后端暂不提供逐版本云端确认。`sync`、`dueAtLocal` 都是只读字段，不要传进保存请求的 item；幂等重试保留原保存结果，其 sync 状态按查询时现状计算。
 
 iCloud REPORT 中可能包含日历目录自身：目录 getetag 为 200，但 calendar-data 为 404。仅忽略与查询目录完全相同且符合此形态的元数据记录；任何真实事件的缺失内容或失败状态仍会中止整轮，避免误删。支持 calendar-data 的文本和 CDATA 表示。
 
@@ -61,10 +63,12 @@ DSH 插件暴露 Cordis hook：
 
 消息/到期 hook 有内置处理器，外部监听器是并行观察者，不是可靠的发送前 veto。不要用它们做额外发送，否则会重复通知。每次催促会调用 DSH 默认模型，使用无工具的独立 Agent 回合并在结束后释放运行实例；成功正文和 Agent session ID 存入共享记忆，对话 Agent 下一轮可见。
 
-schemaVersion 仍为 1，新增可选 `memory`（最近 200 条事件）、`lastReplyId/lastReplyAt`；occurrence 增加 `sentCount/lastText`。旧文件无需重置，原事项及确认状态保留。记忆是持久 JSON 加每轮上下文注入，不是模型参数训练；上下文包括最多 60 项当前事项、40 次 occurrence 和40条近期记忆，完整事项从 MCP 查询。模型失败不算成功发送。30秒为上次成功发送或失败结束后的最短重试间隔，避免慢请求结束后立即再催。
+HTTP/内存 schemaVersion 仍为 1，包含可选 `memory`（最近 200 条事件）、`lastReplyId/lastReplyAt`；occurrence 包含 `sentCount/lastText`。磁盘布局为 v2：memory 和 lastText 来自独立 history.json，读取时合并到内存。旧文件自动迁移，原事项及确认状态保留。记忆是持久 JSON 加每轮上下文注入，不是模型参数训练；上下文包括最多 60 项当前事项、40 次 occurrence 和40条近期记忆，完整事项从 MCP 查询。模型失败不算成功发送。30秒为上次成功发送或失败结束后的最短重试间隔，避免慢请求结束后立即再催。
 
 事项修改到未来会取消旧 occurrence，等待新时间；修改到过去则按新的逾期 occurrence 处理，不代表仍在使用旧时间。Mac 上传确认界面显示服务器确认的时间、时区和版本。最后一次核验之后已交给 QQ 的网络请求无法撤回。
 
-整个存储只能有一个写入服务。MCP 和 Mac 都使用 HTTP API，不直接并发改 JSON。文件原子替换并同步到磁盘，备份上一份 JSON；损坏时拒绝覆盖。进程锁不能代替跨机器分布式锁：不要让两台服务器共享同一个 dataDir。
+整个存储只能有一个写入服务。MCP 和 Mac 都使用 HTTP API，不直接并发改 JSON。月度文件、历史和运行状态分开保存，事务日志与原子替换保证一致性，backup/ 保留上一版分文件快照；损坏时拒绝覆盖。进程锁不能代替跨机器分布式锁：不要让两台服务器共享同一个 dataDir。
 
 0.1.2 增加受同一令牌保护的 `GET /v1/diagnostics`：返回本次进程启动以来各接口的请求计数、最后时间、状态码和成败计数。仅按 User-Agent 归为 mac/other，不把它作为身份认证依据；不记录令牌、请求体或事件内容。统计只保存在内存，重启清空。
+
+磁盘目录、自动迁移及事务恢复见 [分月存储](STORAGE.md)。归档只限制云端同步；QQ 查询、共享记忆和已有提醒规则仍可以读取本地历史事项。

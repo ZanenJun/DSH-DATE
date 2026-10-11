@@ -91,12 +91,14 @@ export class ICloudDAV {
       .map(c=>({url:appleURL(c.url),name:typeof c.displayName==='string'?c.displayName:'未命名'}));
   }
   headers(extra={}) { return {Authorization:`Basic ${Buffer.from(`${this.credentials.username}:${this.credentials.password}`).toString('base64')}`,...extra}; }
-  async list(calendarUrl) {
+  async list(calendarUrl,window) {
     const url=appleURL(calendarUrl);
-    // One full, unexpanded report. Partial/failed responses must never imply deletion.
+    const range=window?{'time-range':{_attributes:{start:new Date(window.from).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z'),end:new Date(window.to).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z')}}}:{};
+    // One complete report for the selected window. Missing from it does NOT
+    // prove deletion: a known event may have been moved outside the range.
     const rows=await this.client.calendarQuery({url,depth:'1',headers:this.headers(),
       props:{'d:getetag':{},'c:calendar-data':{}},
-      filters:[{'comp-filter':{_attributes:{name:'VCALENDAR'},'comp-filter':{_attributes:{name:'VEVENT'}}}}]});
+      filters:[{'comp-filter':{_attributes:{name:'VCALENDAR'},'comp-filter':{_attributes:{name:'VEVENT'},...range}}}]});
     const seen=new Set();
     return rows.map(r=>{
       const data=r.props?.calendarData,raw=typeof data==='string'?data:data?._cdata,etag=r.props?.getetag;

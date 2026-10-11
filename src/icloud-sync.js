@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { editable, occurrencesBetween, problem } from './model.js';
 import { digest, equal, fieldsFor, parseEvent, encodeEvent } from './icloud-codec.js';
+import {syncWindow,withinWindow} from './sync-window.js';
 
 const stateOf = d => d.syncClients.icloud;
 const stripStatus = title => title.replace(/^(?:✓ |⏸ )/, '');
@@ -10,11 +11,14 @@ export class ICloudSync {
     this.inflight=null;this.closed=false;this.failures=0;this.nextAt=0;
   }
   status() {
-    const s=stateOf(this.store.snapshot());
+    const d=this.store.snapshot(),s=stateOf(d);
+    const window=this.window(),pending=Object.entries(s?.pending??{}).filter(([id,p])=>this.pendingInWindow(id,p,s,window,d.items[id])).length;
     return {enabled:true,running:!!this.inflight,lastSyncAt:s?.lastSyncAt??null,lastError:s?.lastError??null,
       conflicts:Object.entries(s?.conflicts??{}).map(([id,c])=>({id,reason:c.reason,at:c.at})),
-      mapped:Object.keys(s?.maps??{}).length,pending:Object.keys(s?.pending??{}).length,unsupported:s?.unsupported??0,intervalMs:this.config.intervalMs};
+      mapped:Object.keys(s?.maps??{}).length,pending,deferredPending:Object.keys(s?.pending??{}).length-pending,window,unsupported:s?.unsupported??0,intervalMs:this.config.intervalMs};
   }
+  window(){return syncWindow(this.clock(),this.config.timeZone);}
+  pendingInWindow(id,p,s,window,item){return withinWindow(p.fields,window)||withinWindow(s?.maps?.[id]?.base,window)||withinWindow(item,window);}
   async initialize() {
     const binding={account:digest(this.dav.credentials.username.toLowerCase()),calendarUrl:this.config.calendarUrl};
     await this.store.transact(d=>{
@@ -73,9 +77,9 @@ export class ICloudSync {
       delete stateOf(d).pending[id];
     });
   }
-  async drainPending() {
-    const state=stateOf(this.store.snapshot());
-    for(const [id,p] of Object.entries(state.pending).filter(([id])=>!state.conflicts[id]).slice(0,20)) {
+  async drainPending(window=this.window()) {
+    const data=this.store.snapshot(),state=stateOf(data);
+    for(const [id,p] of Object.entries(state.pending).filter(([id,p])=>!state.conflicts[id] && this.pendingInWindow(id,p,state,window,data.items[id])).slice(0,20)) {
       if(this.closed)return;
       if(stateOf(this.store.snapshot()).conflicts[id])continue;
       try {
@@ -99,9 +103,10 @@ export class ICloudSync {
     }
   }
   async cycle() {
-    await this.drainPending();
+    const window=this.window();
+    await this.drainPending(window);
     if(this.closed)return;
-    const remote=(await this.dav.list(this.config.calendarUrl)).map(o=>this.decode(o));
+    const remote=(await this.dav.list(this.config.calendarUrl,window)).map(o=>this.decode(o)).filter(r=>r.unsupported || withinWindow(r.fields,window));
     const uids=new Set(),linkedIds=new Set();
     for(const r of remote) {
       if(uids.has(r.uid) || (r.itemId && linkedIds.has(r.itemId)))throw Error('云端事件身份重复');
@@ -133,13 +138,21 @@ export class ICloudSync {
     }
     // Absence must be observed in two complete reports and confirmed by GET 404.
     for(const [id,map] of Object.entries(stateOf(this.store.snapshot()).maps)) {
-      if(map.kind!=='item' || remote.some(r=>r.uid===map.uid || r.href===map.href))continue;
+      if(map.kind!=='item' || !withinWindow(map.base,window) || remote.some(r=>r.uid===map.uid || r.href===map.href))continue;
       const d=this.store.snapshot(),s=stateOf(d),item=d.items[id];
       if(s.pending[id] || s.conflicts[id])continue;
       if(!item || (!item.deletedAt && item.revision!==map.revision)){await this.conflict(id,'云端删除与本地修改冲突');continue;}
+      const found=this.decode(await this.dav.get(map.href));
+      if(found) {
+        if(found.unsupported){await this.conflict(id,found.unsupported,found);continue;}
+        if(withinWindow(found.fields,window))throw Error('云端查询暂时遗漏事件');
+        if(found.uid!==map.uid || item.deletedAt || item.revision!==map.revision){await this.conflict(id,'移出同步范围与本地修改冲突',found);continue;}
+        // Import this known event's boundary move once, then stop tracking it
+        // until it enters the rolling window again. It is not a deletion.
+        await this.importEvent(id,found,item);continue;
+      }
       const missing=(map.missing??0)+1;await this.setMap(id,{...map,missing});
       if(missing<2)continue;
-      if(await this.dav.get(map.href))throw Error('云端查询暂时遗漏事件');
       if(item.deletedAt){await this.store.transact(d=>{delete stateOf(d).maps[id];});continue;}
       try { await this.store.remove({id,baseRevision:item.revision},d=>{delete stateOf(d).maps[id];}); }
       catch(e){if(e.status!==409)throw e;await this.conflict(id,'删除导入时本地已变化');}
@@ -147,6 +160,7 @@ export class ICloudSync {
     for(const item of Object.values(this.store.snapshot().items)) {
       if(this.closed)return;
       const id=item.id,s=stateOf(this.store.snapshot()),map=s.maps[id];
+      if(!withinWindow(item,window) && !withinWindow(map?.base,window))continue;
       if(s.conflicts[id] || s.pending[id] || map?.missing)continue;
       if(item.recurrence){if(map)await this.queueDelete(id,map);continue;}
       if(item.deletedAt) {if(map)await this.queueDelete(id,map);continue;}
@@ -155,14 +169,14 @@ export class ICloudSync {
         await this.queuePut(id,item,map,r);
       }
     }
-    await this.syncProjections(remote);
-    await this.drainPending();
+    await this.syncProjections(remote,window);
+    await this.drainPending(window);
   }
-  async syncProjections(remote) {
+  async syncProjections(remote,window) {
     const d=this.store.snapshot(),wanted=new Map();const now=this.clock();
     for(const item of Object.values(d.items)) {
       if(!item.recurrence || item.deletedAt || !item.enabled || item.status!=='open')continue;
-      for(const dueAt of occurrencesBetween(item,now-7*86400000,now+90*86400000)) {
+      for(const dueAt of occurrencesBetween(item,window.from,window.to-1)) {
         const key=`${item.id}:${item.scheduleVersion}@${dueAt}`,id=`occ-${digest(key)}`;
         const fields=fieldsFor({...item,title:`↻ ${item.title}`,dueAt,status:d.occurrences[key]?.state==='done'?'done':'open'});
         wanted.set(id,{fields,key,revision:digest(JSON.stringify(fields))});
@@ -183,7 +197,7 @@ export class ICloudSync {
       }
     }
     for(const [id,map] of Object.entries(stateOf(this.store.snapshot()).maps)) {
-      if(map.kind!=='projection' || wanted.has(id))continue;
+      if(map.kind!=='projection' || wanted.has(id) || !withinWindow(map.base,window))continue;
       const s=stateOf(this.store.snapshot());if(s.pending[id]||s.conflicts[id])continue;
       const r=remote.find(r=>r.href===map.href);
       if(!r){if(await this.dav.get(map.href))throw Error('云端查询暂时遗漏过期投影');await this.store.transact(d=>{delete stateOf(d).maps[id];});}
@@ -204,6 +218,7 @@ export class ICloudSync {
     if(!item || map?.kind==='projection' || p?.kind==='projection')throw problem('该冲突需要先在 iCloud 恢复事件格式或移除重复项，再联系维护者处理');
     const href=map?.href??p?.href??c.remote?.href;
     const remote=href?this.decode(await this.dav.get(href)):null;
+    if(!withinWindow(item,this.window()) && !withinWindow(map?.base,this.window()) && !withinWindow(remote?.fields,this.window()))throw problem('该事项在三个月同步范围外，保留归档，暂不处理云端冲突',409);
     if(remote?.unsupported)throw problem(remote.unsupported);
     if(prefer==='remote') {
       if(item.deletedAt && remote)throw problem('本地已删除；请保留云端副本并以新事件重新导入，不能复活删除记录');

@@ -1,9 +1,12 @@
+import {syncWindow,withinWindow} from './sync-window.js';
 // Sync receipts are derived from the current item revision and cloud read-back map,
 // never from a successful local save alone. Device-side refresh is not observable.
-export function itemSyncStatus(item, data, {enabled=false,available=false,error=null}={}) {
+export function itemSyncStatus(item, data, {enabled=false,available=false,error=null,now=Date.now(),timeZone='Asia/Shanghai'}={}) {
   if(!enabled)return {backend:'mac',state:'unverified',message:'已保存到 Linux；未确认 Mac 日历同步。'};
   const s=data.syncClients?.icloud,map=s?.maps?.[item.id];
   const base={backend:'icloud',lastSyncAt:s?.lastSyncAt??null};
+  const window=syncWindow(now,timeZone);
+  if(!item.recurrence && !withinWindow(item,window) && !withinWindow(map?.base,window))return {...base,state:'archived',window,message:'已按月归档；当前只同步上个月、本月和下个月，本项暂不参与同步。'};
   if(s?.conflicts?.[item.id])return {...base,state:'conflict',message:'两端版本冲突，尚未完成同步。'};
   if(item.deletedAt && !map && !s?.pending?.[item.id])return {...base,state:'unverified',message:'本地已删除，当前无云端映射及待发送请求；不将历史删除记录算作待上传事项。'};
   if(!available || error || s?.lastError)return {...base,state:'error',message:'已保存到 Linux；iCloud 同步异常，尚未确认本次更改上传。'};

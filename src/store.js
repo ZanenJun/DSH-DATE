@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { normalizeItem, editable, problem } from './model.js';
 import { remember } from './memory.js';
+import {partition,readStorageSync,validateJournal} from './storage-layout.js';
 
 export async function atomicJSON(file, data) {
   const tmp = `${file}.${randomUUID()}.tmp`;
@@ -16,10 +17,27 @@ export async function atomicJSON(file, data) {
   } catch (e) { await fs.unlink(tmp).catch(() => {}); throw e; }
 }
 
+async function applyParts(directory,parts,previous={}) {
+  await fs.mkdir(path.join(directory,'calendar'),{recursive:true,mode:0o700});
+  // The index is replaced last. .transaction.json remains authoritative until
+  // every destination is durable, so a crash is replayable without a partial month move.
+  for(const name of [...Object.keys(parts).filter(n=>n!=='calendar.json'),'calendar.json']) {
+    if(JSON.stringify(parts[name])!==JSON.stringify(previous[name]))await atomicJSON(path.join(directory,name),parts[name]);
+  }
+  await fs.unlink(path.join(directory,'.transaction.json'));
+  const dir=await fs.open(directory,'r');try{await dir.sync();}finally{await dir.close();}
+}
+async function publishParts(directory,parts,previous={}) {
+  await fs.mkdir(directory,{recursive:true,mode:0o700});
+  await atomicJSON(path.join(directory,'.transaction.json'),{schemaVersion:1,parts});
+  await applyParts(directory,parts,previous);
+}
+
 export class CalendarStore {
-  constructor(directory, { clock = Date.now } = {}) {
+  constructor(directory, { clock = Date.now, timeZone='Asia/Shanghai' } = {}) {
     this.directory = directory; this.file = path.join(directory, 'calendar.json');
     this.lock = path.join(directory, 'writer.lock'); this.clock = clock; this.tail = Promise.resolve();
+    this.timeZone=timeZone;
   }
   async open() {
     await fs.mkdir(this.directory, { recursive: true, mode: 0o700 });
@@ -38,26 +56,51 @@ export class CalendarStore {
       }
     }
     try {
-      try { this.data = JSON.parse(await fs.readFile(this.file, 'utf8')); }
+      this.poisoned=false;
+      try {
+        const journal=JSON.parse(await fs.readFile(path.join(this.directory,'.transaction.json'),'utf8'));
+        await applyParts(this.directory,validateJournal(journal));
+      }catch(e){if(e.code!=='ENOENT')throw e;}
+      try {const loaded=readStorageSync(this.directory);this.data=loaded.data;this.parts=loaded.parts;}
       catch (e) {
-        if (e.code !== 'ENOENT') throw new Error('calendar.json is unreadable; refusing to overwrite it', { cause: e });
+        const indexExists=await fs.access(this.file).then(()=>true,err=>{if(err.code==='ENOENT')return false;throw err;});
+        if (e.code !== 'ENOENT' || indexExists) throw new Error('calendar.json is unreadable; refusing to overwrite it', { cause: e });
+        const layoutFiles=await Promise.all(['state.json','history.json'].map(name=>fs.access(path.join(this.directory,name)).then(()=>true,err=>{if(err.code==='ENOENT')return false;throw err;})));
+        const months=await fs.readdir(path.join(this.directory,'calendar')).catch(err=>{if(err.code==='ENOENT')return [];throw err;});
+        if(layoutFiles.some(Boolean)||months.length)throw Error('calendar.json index is missing; refusing to overwrite existing partitions');
         this.data = { schemaVersion: 1, revision: 0, items: {}, occurrences: {}, receipts: {}, seenMessages: [], lastDeliveryAt: null, syncClients: {} };
-        await atomicJSON(this.file, this.data);
+        this.parts=null;
       }
       if (this.data.schemaVersion !== 1 || !this.data.items || !this.data.occurrences || !Number.isInteger(this.data.revision)) throw new Error('Unsupported calendar data schema');
       for (const item of Object.values(this.data.items)) normalizeItem(editable(item));
+      if(!this.parts) {
+        // Preserve the original mixed v1 file once, outside the active layout.
+        await fs.mkdir(path.join(this.directory,'legacy'),{recursive:true,mode:0o700});
+        for(const suffix of ['','.backup'])try {
+          await fs.copyFile(this.file+suffix,path.join(this.directory,'legacy',`calendar-v1${suffix}.json`),fs.constants.COPYFILE_EXCL);
+        }catch(e){if(!['ENOENT','EEXIST'].includes(e.code))throw e;}
+        this.parts=partition(this.data,this.timeZone);
+        await publishParts(this.directory,this.parts);
+        await fs.unlink(this.file+'.backup').catch(e=>{if(e.code!=='ENOENT')throw e;});
+      }
       return this;
     } catch (e) { await this.close(); throw e; }
   }
-  snapshot() { return structuredClone(this.data); }
+  snapshot() {if(this.poisoned)throw Error('Calendar commit interrupted; restart to recover');return structuredClone(this.data);}
   async transact(fn) {
     const run = this.tail.then(async () => {
+      if(this.poisoned)throw Error('Calendar commit interrupted; restart to recover the durable transaction');
       const next = structuredClone(this.data);
       const result = await fn(next);
       if (JSON.stringify(next) !== JSON.stringify(this.data)) {
         next.revision++;
-        await atomicJSON(this.file + '.backup', this.data);
-        await atomicJSON(this.file, next);
+        const parts=partition(next,this.timeZone,this.parts['calendar.json'].months);
+        try {
+          await publishParts(path.join(this.directory,'backup'),this.parts,this.backupParts??{});
+          this.backupParts=this.parts;
+          await publishParts(this.directory,parts,this.parts);
+        }catch(e){this.poisoned=true;throw e;}
+        this.parts=parts;
         this.data = next;
       }
       return structuredClone(result);

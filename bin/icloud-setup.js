@@ -6,6 +6,7 @@ import { digest } from '../src/icloud-codec.js';
 import { readConfig } from '../src/config.js';
 import { atomicJSON } from '../src/store.js';
 import { localClient } from '../src/client.js';
+import {readStorageSync} from '../src/storage-layout.js';
 
 async function question(text) {
   const r=readline.createInterface({input:process.stdin,output:process.stdout});
@@ -44,7 +45,7 @@ export async function setupICloud(configFile) {
     if(!Number.isInteger(chosen)||!calendars[chosen])throw Error('无效序号；未保存配置');
     const calendarUrl=appleURL(calendars[chosen].url);
     let state;
-    try{state=JSON.parse(await fs.readFile(path.join(config.dataDir,'calendar.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+    try{state=readStorageSync(config.dataDir).data;}catch(e){if(e.code!=='ENOENT')throw e;}
     const bound=state?.syncClients?.icloud?.binding;
     if(bound && (bound.account!==digest(username.toLowerCase()) || bound.calendarUrl!==calendarUrl))throw Error('已有另一账户/日历的同步映射；为避免重复导入，需先迁移，未覆盖配置');
     const creds=path.join(config.dataDir,'icloud-credentials.json');
