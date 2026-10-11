@@ -7,7 +7,8 @@ import {CalendarStore} from '../src/store.js';
 import {ReminderScheduler} from '../src/scheduler.js';
 import {ICloudSync} from '../src/icloud-sync.js';
 import {ICloudDAV,appleURL,loadCloudCredentials,cloudFailureMessage} from '../src/icloud-dav.js';
-import {encodeEvent,parseEvent,fieldsFor} from '../src/icloud-codec.js';
+import {encodeEvent,parseEvent,fieldsFor,digest} from '../src/icloud-codec.js';
+import {itemSyncStatus} from '../src/sync-status.js';
 import {startService,tokenFor} from '../src/service.js';
 import {readConfig} from '../src/config.js';
 import {syncWindow,withinWindow} from '../src/sync-window.js';
@@ -104,12 +105,103 @@ test('unsupported events and future years stay in iCloud without importing outsi
   s.dav.seed('future',item({dueAt:'2036-10-11T07:00:00.000Z'}));await s.sync.tick(true);
   assert.equal(Object.keys(s.store.snapshot().items).length,0);assert.equal(s.sync.status().unsupported,1);assert.equal(s.dav.objects.size,2);
 });
-test('habit projections stay one-way and completed occurrences are reflected without creating todos',async t=>{
-  const s=await fixture(t);await s.store.upsert({id:'habit',item:{...item(),kind:'habit',recurrence:{frequency:'daily',until:new Date(at+86400000).toISOString()}}});
+test('ordinary recurring events retain one-way projections and reflect completed occurrences',async t=>{
+  const s=await fixture(t);await s.store.upsert({id:'recurring',item:{...item(),kind:'event',recurrence:{frequency:'daily',until:new Date(at+86400000).toISOString()}}});
   await s.sync.tick(true);assert.equal(s.dav.objects.size,2);
   await s.sync.tick(true);assert.equal(s.dav.puts,2);assert.equal(Object.keys(s.store.snapshot().items).length,1);
-  const scheduler=new ReminderScheduler(s.store,{clock:()=>at,ownerQQ:'1',botQQ:'2',send:async()=>({message_id:1})});await scheduler.tick();await scheduler.act({action:'complete',itemId:'habit'});
+  const scheduler=new ReminderScheduler(s.store,{clock:()=>at,ownerQQ:'1',botQQ:'2',send:async()=>({message_id:1})});await scheduler.tick();await scheduler.act({action:'complete',itemId:'recurring'});
   await s.sync.tick(true);assert.ok([...s.dav.objects.values()].some(o=>parseEvent(o.raw).fields.title.startsWith('✓')));
+});
+test('habits remain local-only even when due or completed and do not depend on cloud availability',async t=>{
+  const s=await fixture(t);
+  const saved=await s.store.upsert({id:'local-habit',item:item({kind:'habit',recurrence:{frequency:'daily'}})});
+  await s.sync.tick(true);await s.sync.tick(true);
+  const scheduler=new ReminderScheduler(s.store,{clock:()=>at,ownerQQ:'1',botQQ:'2',send:async()=>({message_id:1})});
+  await scheduler.tick();await scheduler.act({action:'complete',itemId:saved.id});await s.sync.tick(true);
+  assert.equal(s.dav.puts,0);assert.equal(s.dav.objects.size,0);
+  assert.ok(Object.values(s.store.snapshot().occurrences).some(o=>o.itemId===saved.id && o.state==='done'));
+  for(const options of [{},{enabled:true,available:true},{enabled:true,available:false,error:'offline'}]) {
+    const receipt=itemSyncStatus(saved,s.store.snapshot(),options);
+    assert.equal(receipt.backend,'local');assert.equal(receipt.state,'local-only');assert.match(receipt.message,/不写入日历/);
+  }
+});
+async function legacyProjection(s,habit,dueAt,{pending=false,uploaded=true}={}) {
+  const occurrence=`${habit.id}:${habit.scheduleVersion}@${dueAt}`,id=`occ-${digest(occurrence)}`,uid=`dsh-${id}@dsh-calendar`;
+  const fields=fieldsFor({...habit,title:`↻ ${habit.title}`,dueAt});
+  const href=base+encodeURIComponent(uid)+'.ics',raw=encodeEvent({uid,occurrence,fields});
+  if(uploaded)s.dav.seed(uid,fields,{occurrence});
+  await s.store.transact(d=>{
+    if(pending)d.syncClients.icloud.pending[id]={action:'put',kind:'projection',uid,href,etag:null,revision:digest(JSON.stringify(fields)),fields,raw};
+    else d.syncClients.icloud.maps[id]={kind:'projection',uid,href,etag:s.dav.objects.get(href).etag,revision:digest(JSON.stringify(fields)),base:fields,missing:0};
+  });
+  return {id,href,fields};
+}
+test('startup cancels unsent legacy habit PUTs and safely cleans up PUTs whose response was lost',async t=>{
+  const s=await fixture(t),habit=await s.store.upsert({id:'legacy-habit',item:item({kind:'habit',recurrence:{frequency:'daily'}})});
+  const unsent=await legacyProjection(s,habit,'2026-10-11T07:00:00.000Z',{pending:true,uploaded:false});
+  const sent=await legacyProjection(s,habit,'2026-10-12T07:00:00.000Z',{pending:true});
+  const unrelated=s.dav.seed('personal-appointment',item({title:'不要删除'}));
+  const resumed=await s.restart();await resumed.tick(true);
+  assert.equal(s.dav.puts,0);assert.equal(s.dav.deletes,1);
+  assert.equal(await s.dav.get(sent.href),null);assert.ok(await s.dav.get(unrelated));
+  const cloud=s.store.snapshot().syncClients.icloud;
+  assert.equal(cloud.pending[unsent.id],undefined);assert.equal(cloud.pending[sent.id],undefined);
+  assert.equal(Object.keys(cloud.maps).length,1);assert.equal(resumed.status().conflicts.length,0);
+});
+test('retiring legacy habit projections preserves manually changed and out-of-window cloud data',async t=>{
+  const s=await fixture(t),habit=await s.store.upsert({id:'old-habit',item:item({kind:'habit',recurrence:{frequency:'daily'}})});
+  const clean=await legacyProjection(s,habit,'2026-10-11T07:00:00.000Z');
+  const edited=await legacyProjection(s,habit,'2026-10-12T07:00:00.000Z');s.dav.edit(edited.href,{title:'手工修改保留'});
+  const moved=await legacyProjection(s,habit,'2026-10-13T07:00:00.000Z');s.dav.edit(moved.href,{dueAt:'2026-12-13T07:00:00.000Z'});
+  const archived=await legacyProjection(s,habit,'2026-08-11T07:00:00.000Z');
+  const deferred=await legacyProjection(s,habit,'2026-08-12T07:00:00.000Z',{pending:true});
+  const unrelated=s.dav.seed('manual-projection',item(),{occurrence:'unmanaged:1@2026-10-11T07:00:00.000Z'});
+  const reads=[];const get=s.dav.get.bind(s.dav);s.dav.get=async href=>{reads.push(href);return get(href);};
+  await s.sync.tick(true);await s.sync.tick(true);
+  assert.equal(s.dav.puts,0);assert.equal(s.dav.deletes,1);assert.equal(await get(clean.href),null);
+  for(const value of [edited,moved,archived,deferred])assert.ok(await get(value.href));
+  assert.ok(await get(unrelated));assert.ok(!reads.includes(archived.href));assert.ok(!reads.includes(deferred.href));
+  const cloud=s.store.snapshot().syncClients.icloud;
+  assert.ok(cloud.conflicts[edited.id]);assert.ok(cloud.conflicts[moved.id]);
+  assert.equal(cloud.pending[deferred.id].action,'retire');assert.equal(s.sync.status().lastError,null);
+});
+test('legacy pending habit upload does not delete a manually edited cloud version',async t=>{
+  const s=await fixture(t),habit=await s.store.upsert({id:'pending-habit',item:item({kind:'habit',recurrence:{frequency:'daily'}})});
+  const pending=await legacyProjection(s,habit,habit.dueAt,{pending:true});s.dav.edit(pending.href,{title:'人工修改'});
+  await s.sync.tick(true);
+  assert.equal(s.dav.puts,0);assert.equal(s.dav.deletes,0);assert.equal(parseEvent((await s.dav.get(pending.href)).raw).fields.title,'人工修改');
+  assert.ok(s.store.snapshot().syncClients.icloud.conflicts[pending.id]);
+});
+test('lost-response habit cleanup preserves later cloud location and alarm edits',async t=>{
+  const s=await fixture(t),habit=await s.store.upsert({id:'metadata-habit',item:item({kind:'habit',recurrence:{frequency:'daily'}})});
+  const pending=await legacyProjection(s,habit,habit.dueAt,{pending:true});
+  const old=s.dav.objects.get(pending.href);
+  s.dav.objects.set(pending.href,{...old,etag:'"manually-edited"',raw:old.raw.replace('END:VEVENT','LOCATION:办公室\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT5M\r\nDESCRIPTION:提醒\r\nEND:VALARM\r\nEND:VEVENT')});
+  await s.sync.tick(true);
+  assert.equal(s.dav.puts,0);assert.equal(s.dav.deletes,0);assert.ok(await s.dav.get(pending.href));
+  assert.ok(s.store.snapshot().syncClients.icloud.conflicts[pending.id]);
+});
+test('converting a synced event to a habit removes only its unchanged managed cloud copy',async t=>{
+  const s=await fixture(t);await s.store.upsert({id:'convert-clean',item:item()});await s.store.upsert({id:'convert-edited',item:item()});
+  await s.sync.tick(true);const maps=s.store.snapshot().syncClients.icloud.maps;
+  for(const id of ['convert-clean','convert-edited'])await s.store.upsert({id,baseRevision:1,item:item({kind:'habit',recurrence:{frequency:'daily'}})});
+  s.dav.edit(maps['convert-edited'].href,{title:'云端修改不能覆盖习惯'});
+  await s.sync.tick(true);await s.sync.tick(true);
+  assert.equal(await s.dav.get(maps['convert-clean'].href),null);assert.ok(await s.dav.get(maps['convert-edited'].href));
+  assert.equal(s.dav.deletes,1);assert.equal(s.dav.puts,2);
+  for(const id of ['convert-clean','convert-edited'])assert.equal(s.store.snapshot().items[id].kind,'habit');
+  assert.ok(s.store.snapshot().syncClients.icloud.conflicts['convert-edited']);
+  await assert.rejects(s.sync.resolve('convert-edited','remote'),/冲突需要/);
+});
+test('a pending event converted to a habit during its GET cannot be uploaded afterward',async t=>{
+  const s=await fixture(t),saved=await s.store.upsert({id:'racing-habit',item:item()});
+  await s.sync.queuePut(saved.id,saved,null,null);
+  const get=s.dav.get.bind(s.dav);let changed=false;
+  s.dav.get=async href=>{
+    if(!changed){changed=true;await s.store.upsert({id:saved.id,baseRevision:saved.revision,item:item({kind:'habit',recurrence:{frequency:'daily'}})});}
+    return get(href);
+  };
+  await s.sync.tick(true);assert.equal(s.dav.puts,0);assert.equal(s.sync.status().pending,0);
 });
 test('a concurrent local update during outbound PUT remains queued for the next round',async t=>{
   const s=await fixture(t);await s.store.upsert({id:'racing',item:item()});const put=s.dav.put.bind(s.dav);let once=true;
@@ -311,8 +403,8 @@ test('month rollover archives earlier events without deleting either copy and im
   assert.equal(s.store.snapshot().items[id].title,'学习');assert.equal(s.store.snapshot().items[id].deletedAt,null);
   assert.equal(Object.keys(s.store.snapshot().items).length,2);assert.equal(s.dav.deletes,0);assert.equal(s.dav.objects.size,2);
 });
-test('old habit rules generate only window projections and rolling out does not delete cloud history',async t=>{
-  const s=await fixture(t);await s.store.upsert({id:'old-rule',item:item({dueAt:'2026-06-01T07:00:00.000Z',kind:'habit',recurrence:{frequency:'weekly',weekdays:[1]}})});
+test('old ordinary recurring rules project only inside the window and preserve cloud history on rollover',async t=>{
+  const s=await fixture(t);await s.store.upsert({id:'old-rule',item:item({dueAt:'2026-06-01T07:00:00.000Z',kind:'todo',recurrence:{frequency:'weekly',weekdays:[1]}})});
   await s.sync.tick(true);assert.ok(s.dav.objects.size>0);
   for(const o of s.dav.objects.values())assert.ok(withinWindow(parseEvent(o.raw).fields,s.sync.window()));
   const count=s.dav.objects.size;s.setNow(Date.parse('2026-11-01T00:00:00Z'));await s.sync.tick(true);
@@ -349,7 +441,7 @@ async function toolFixture(t, options={}) {
   };
   return {dav,svc,call,config};
 }
-test('all four stdio MCP tools automatically sync: read imports and each write exports',async t=>{
+test('stdio calendar MCP tools automatically sync: read imports and each write exports',async t=>{
   const {dav,call,config}=await toolFixture(t);
   assert.equal(config.icloud.intervalMs,20000);
   const href=dav.seed('from-apple',item());
@@ -364,6 +456,15 @@ test('all four stdio MCP tools automatically sync: read imports and each write e
   assert.ok([...dav.objects.values()].some(o=>parseEvent(o.raw).fields.title.startsWith('✓ ')));
   const deleted=await call('calendar_delete',{id:saved.id,baseRevision:done.item.revision});
   assert.ok(deleted.deletedAt);assert.equal(deleted.toolSync.state,'finished');assert.equal(dav.objects.size,1);assert.equal(dav.lists,5);
+});
+test('routine MCP save and delete trigger cloud sync while habits remain local-only',async t=>{
+  const {dav,call}=await toolFixture(t);
+  const saved=await call('routine_save',{collection:'habits',id:'water',item:{title:'喝水',defaultTime:'08:00'}});
+  assert.equal(saved.sync.state,'local-only');assert.equal(saved.toolSync.state,'finished');assert.equal(dav.lists,1);
+  assert.equal(dav.puts,0);assert.equal(dav.objects.size,0);
+  const removed=await call('routine_delete',{collection:'habits',id:saved.id,baseRevision:saved.revision});
+  assert.ok(removed.deletedAt);assert.equal(removed.toolSync.state,'finished');assert.equal(dav.lists,2);
+  assert.equal(dav.puts,0);assert.equal(dav.objects.size,0);
 });
 test('cloud failures do not turn committed MCP writes into errors and later tools bypass backoff',async t=>{
   const {dav,svc,call}=await toolFixture(t);

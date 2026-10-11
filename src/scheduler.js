@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import {DateTime} from 'luxon';
 import { latestDue, problem } from './model.js';
 import { remember, replyText } from './memory.js';
 
@@ -16,12 +17,19 @@ export class ReminderScheduler {
       const batch = await this.store.transact(d => {
         for (const item of Object.values(d.items)) {
           if (item.deletedAt || !item.enabled || item.status !== 'open') continue;
+          const today=DateTime.fromMillis(now).setZone(item.timeZone).toISODate();
+          const reminderDay=o=>DateTime.fromMillis(o.snoozeUntil??Date.parse(o.dueAt)).setZone(item.timeZone).toISODate();
+          if(item.kind==='habit')for(const o of Object.values(d.occurrences)) {
+            if(o.itemId===item.id && o.state==='active' && reminderDay(o)<today)o.state='superseded';
+          }
           const dueAt = latestDue(item, now);
           if (!dueAt) continue;
+          if(item.kind==='habit' && DateTime.fromISO(dueAt).setZone(item.timeZone).toISODate()!==today)continue;
           const key = `${item.id}:${item.scheduleVersion}@${dueAt}`;
           // A new habit occurrence supersedes yesterday's nagging, never its history.
           for (const o of Object.values(d.occurrences)) {
-            if (o.itemId === item.id && o.key !== key && o.state === 'active' && item.recurrence) o.state = 'superseded';
+            if (o.itemId === item.id && o.key !== key && o.state === 'active' && item.recurrence
+              && !(item.kind==='habit' && o.snoozeUntil!=null && reminderDay(o)>=today)) o.state = 'superseded';
           }
           d.occurrences[key] ??= { key, itemId: item.id, dueAt, state: 'active', attempts: 0, firstAttemptAt: null, lastAttemptAt: null, acknowledgedAt: null, completedAt: null, snoozeUntil: null };
         }
@@ -84,11 +92,11 @@ export class ReminderScheduler {
       if (d.seenMessages.includes(id)) return [];
       d.seenMessages.push(id); d.seenMessages = d.seenMessages.slice(-2000);
       if (at >= (d.lastReplyAt ?? 0)) { d.lastReplyAt = at; d.lastReplyId = id; }
-      remember(d, { type: 'user-reply', text: replyText(event), messageAt: at }, this.clock());
+      remember(d, { type: 'user-reply', messageId:id, text: replyText(event), messageAt: at }, this.clock());
       const keys = [];
       for (const o of Object.values(d.occurrences)) {
         if (o.state === 'active' && o.firstAttemptAt !== null && at >= Math.floor(o.firstAttemptAt / 1000) * 1000) {
-          o.state = 'acknowledged'; o.acknowledgedAt = this.clock(); keys.push(o.key);
+          o.state = 'acknowledged'; o.acknowledgedAt = at; keys.push(o.key);
         }
       }
       return keys;

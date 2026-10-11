@@ -96,7 +96,7 @@ test('authenticated HTTP API and real stdio MCP client can list/create; browser 
   const client = new Client({ name:'test',version:'1' });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('src/mcp.js'), cfg], stderr: 'pipe' }));
   t.after(() => client.close());
-  assert.equal((await client.listTools()).tools.length, 4);
+  assert.equal((await client.listTools()).tools.length, 6);
   const added = await client.callTool({ name:'calendar_save', arguments: { id:'mcp-task', item:input() } }); assert.ok(!added.isError, JSON.stringify(added));
   const state = JSON.parse((await client.callTool({ name:'calendar_list',arguments:{} })).content[0].text);
   assert.equal(state.items[0].id, 'mcp-task'); assert.equal(state.qqConnected, true);

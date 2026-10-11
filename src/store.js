@@ -1,9 +1,40 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { DateTime } from 'luxon';
 import { normalizeItem, editable, problem } from './model.js';
 import { remember } from './memory.js';
 import {partition,readStorageSync,validateJournal} from './storage-layout.js';
+import {dailyTaskInput,habitInput,habitItem,habitTime,timeOnDate} from './routines.js';
+
+function validId(value,max=100) {
+  return typeof value==='string' && !Object.hasOwn(Object.prototype,value) && value!=='prototype'
+    && new RegExp(`^[\\w-]{1,${max}}$`).test(value);
+}
+function validateRoutineRequest(collection,id,baseRevision,operationId,remove=false) {
+  if(!['dailyTasks','habits'].includes(collection) || !validId(id,collection==='dailyTasks'?72:100)
+    || !validId(operationId,128) || !Number.isInteger(baseRevision) || baseRevision<(remove?1:0))throw problem('Invalid routine request');
+}
+function writeItem(data,id,normalized,now,defaultTime) {
+  const old=data.items[id],at=new Date(now).toISOString();
+  const next={...normalized,id,revision:(old?.revision??0)+1,createdAt:old?.createdAt??at,updatedAt:at,deletedAt:null};
+  for(const field of ['dailyTaskId','dailyDate'])if(old?.[field]!==undefined)next[field]=old[field];
+  if(next.kind==='habit')next.defaultTime=defaultTime ?? (old?.kind==='habit' && old.dueAt===next.dueAt && old.timeZone===next.timeZone
+    ? habitTime(old) : habitTime(next));
+  const scheduleChanged=old && (['dueAt','timeZone','recurrence'].some(key=>JSON.stringify(old[key])!==JSON.stringify(next[key]))
+    || (old.kind==='habit' && next.kind==='habit' && habitTime(old)!==next.defaultTime)
+    || (!old.enabled && next.enabled) || (old.status!=='open' && next.status==='open'));
+  next.scheduleVersion=(old?.scheduleVersion??1)+(scheduleChanged?1:0);
+  data.items[id]=next;
+  remember(data,{type:old?'item-updated':'item-created',itemId:id,title:next.title,dueAt:next.dueAt,
+    ...(old?{previousDueAt:old.dueAt}:{}),timeZone:next.timeZone,revision:next.revision},now);
+  for(const occurrence of Object.values(data.occurrences)) {
+    if(occurrence.itemId===id && ['active','acknowledged'].includes(occurrence.state)
+      && (scheduleChanged || !next.enabled || next.status!=='open'))occurrence.state='cancelled';
+  }
+  return next;
+}
 
 export async function atomicJSON(file, data) {
   const tmp = `${file}.${randomUUID()}.tmp`;
@@ -65,14 +96,16 @@ export class CalendarStore {
       catch (e) {
         const indexExists=await fs.access(this.file).then(()=>true,err=>{if(err.code==='ENOENT')return false;throw err;});
         if (e.code !== 'ENOENT' || indexExists) throw new Error('calendar.json is unreadable; refusing to overwrite it', { cause: e });
-        const layoutFiles=await Promise.all(['state.json','history.json'].map(name=>fs.access(path.join(this.directory,name)).then(()=>true,err=>{if(err.code==='ENOENT')return false;throw err;})));
+        const layoutFiles=await Promise.all(['state.json','history.json','daily-tasks.json','habits.json'].map(name=>fs.access(path.join(this.directory,name)).then(()=>true,err=>{if(err.code==='ENOENT')return false;throw err;})));
         const months=await fs.readdir(path.join(this.directory,'calendar')).catch(err=>{if(err.code==='ENOENT')return [];throw err;});
         if(layoutFiles.some(Boolean)||months.length)throw Error('calendar.json index is missing; refusing to overwrite existing partitions');
-        this.data = { schemaVersion: 1, revision: 0, items: {}, occurrences: {}, receipts: {}, seenMessages: [], lastDeliveryAt: null, syncClients: {} };
+        this.data = { schemaVersion: 1, revision: 0, items: {}, occurrences: {}, dailyTasks:{}, receipts: {}, seenMessages: [], lastDeliveryAt: null, syncClients: {} };
         this.parts=null;
       }
       if (this.data.schemaVersion !== 1 || !this.data.items || !this.data.occurrences || !Number.isInteger(this.data.revision)) throw new Error('Unsupported calendar data schema');
       for (const item of Object.values(this.data.items)) normalizeItem(editable(item));
+      this.data.dailyTasks??={};
+      for(const item of Object.values(this.data.dailyTasks))dailyTaskInput.parse(Object.fromEntries(['title','notes','timeZone','enabled','defaultStartTime','defaultDurationMinutes'].map(key=>[key,item[key]])));
       if(!this.parts) {
         // Preserve the original mixed v1 file once, outside the active layout.
         await fs.mkdir(path.join(this.directory,'legacy'),{recursive:true,mode:0o700});
@@ -82,6 +115,14 @@ export class CalendarStore {
         this.parts=partition(this.data,this.timeZone);
         await publishParts(this.directory,this.parts);
         await fs.unlink(this.file+'.backup').catch(e=>{if(e.code!=='ENOENT')throw e;});
+      } else if(this.parts['calendar.json'].layoutVersion!==2) {
+        // The old monthly layout may contain habits. Preserve it as a complete
+        // backup, then atomically publish separate routine collections.
+        await publishParts(path.join(this.directory,'backup'),this.parts);
+        this.backupParts=this.parts;
+        const parts=partition(this.data,this.timeZone,this.parts['calendar.json'].months);
+        await publishParts(this.directory,parts,this.parts);
+        this.parts=parts;
       }
       return this;
     } catch (e) { await this.close(); throw e; }
@@ -125,18 +166,10 @@ export class CalendarStore {
         return d.receipts[operationId].result;
       }
       const old = d.items[id];
+      if(Object.hasOwn(d.dailyTasks??{},id))throw problem('ID already belongs to a daily task template',409);
       if ((old?.revision ?? 0) !== baseRevision) throw problem('Revision conflict: reload item before editing', 409);
       if (old?.deletedAt) throw problem('Deleted items cannot be resurrected; create a new item', 409);
-      const now = new Date(this.clock()).toISOString();
-      const next = { ...normalized, id, revision: (old?.revision ?? 0) + 1, createdAt: old?.createdAt ?? now, updatedAt: now, deletedAt: null };
-      const scheduleChanged = old && (['dueAt', 'timeZone', 'recurrence'].some(k => JSON.stringify(old[k]) !== JSON.stringify(next[k])) || (!old.enabled && next.enabled) || (old.status !== 'open' && next.status === 'open'));
-      next.scheduleVersion = (old?.scheduleVersion ?? 1) + (scheduleChanged ? 1 : 0);
-      d.items[id] = next;
-      remember(d, { type: old ? 'item-updated' : 'item-created', itemId: id, title: next.title,
-        dueAt: next.dueAt, previousDueAt: old?.dueAt, timeZone: next.timeZone, revision: next.revision }, this.clock());
-      for (const occurrence of Object.values(d.occurrences)) {
-        if (occurrence.itemId === id && ['active', 'acknowledged'].includes(occurrence.state) && (scheduleChanged || !next.enabled || next.status !== 'open')) occurrence.state = 'cancelled';
-      }
+      const next = writeItem(d,id,normalized,this.clock());
       d.receipts[operationId] = { fingerprint, result: structuredClone(next) };
       onCommit(d, next);
       return next;
@@ -159,6 +192,81 @@ export class CalendarStore {
       d.receipts[operationId] = { fingerprint, result: structuredClone(item) };
       onCommit(d, item);
       return item;
+    });
+  }
+  async saveRoutine({collection,id,baseRevision=0,operationId=randomUUID(),item}) {
+    id??=`routine_${createHash('sha256').update(String(operationId)).digest('hex').slice(0,32)}`;
+    validateRoutineRequest(collection,id,baseRevision,operationId);
+    const parsed=(collection==='dailyTasks'?dailyTaskInput:habitInput).parse(item);
+    return this.transact(d=>{
+      const fingerprint=JSON.stringify({collection,id,baseRevision,item:parsed});
+      if(d.receipts[operationId]) {
+        if(d.receipts[operationId].fingerprint!==fingerprint)throw problem('operationId was reused for a different change',409);
+        return d.receipts[operationId].result;
+      }
+      const templates=d.dailyTasks??={},old=collection==='dailyTasks'?templates[id]:d.items[id];
+      if((collection==='dailyTasks' && Object.hasOwn(d.items,id))
+        || (collection==='habits' && (Object.hasOwn(templates,id) || (old && old.kind!=='habit'))))throw problem('ID belongs to a different collection',409);
+      if((old?.revision??0)!==baseRevision)throw problem('Revision conflict: reload routine before editing',409);
+      if(old?.deletedAt)throw problem('Deleted routines cannot be resurrected; create a new routine',409);
+      const now=this.clock(),at=new Date(now).toISOString();
+      let next;
+      if(collection==='habits')next=writeItem(d,id,habitItem(parsed,now,old),now,parsed.defaultTime);
+      else {
+        next={...parsed,id,revision:(old?.revision??0)+1,createdAt:old?.createdAt??at,updatedAt:at,deletedAt:null};
+        templates[id]=next;
+        remember(d,{type:old?'daily-task-updated':'daily-task-created',itemId:id,title:next.title,
+          defaultStartTime:next.defaultStartTime,defaultDurationMinutes:next.defaultDurationMinutes,timeZone:next.timeZone,revision:next.revision},now);
+      }
+      d.receipts[operationId]={fingerprint,result:structuredClone(next)};
+      return next;
+    });
+  }
+  async removeRoutine({collection,id,baseRevision,operationId=randomUUID()}) {
+    validateRoutineRequest(collection,id,baseRevision,operationId,true);
+    return this.transact(d=>{
+      const fingerprint=JSON.stringify({deleteRoutine:collection,id,baseRevision});
+      if(d.receipts[operationId]) {
+        if(d.receipts[operationId].fingerprint!==fingerprint)throw problem('operationId reused',409);
+        return d.receipts[operationId].result;
+      }
+      const item=collection==='dailyTasks'?d.dailyTasks?.[id]:d.items[id];
+      if(!item || (collection==='habits' && item.kind!=='habit'))throw problem('Routine not found',404);
+      if(item.revision!==baseRevision)throw problem('Revision conflict: reload before deleting routine',409);
+      if(item.deletedAt)throw problem('Routine is already deleted',409);
+      const now=this.clock();item.deletedAt=new Date(now).toISOString();item.updatedAt=item.deletedAt;item.revision++;
+      for(const occurrence of Object.values(d.occurrences)) {
+        if(occurrence.itemId===id && ['active','acknowledged'].includes(occurrence.state))occurrence.state='cancelled';
+      }
+      remember(d,{type:collection==='dailyTasks'?'daily-task-deleted':'item-deleted',itemId:id,title:item.title},now);
+      d.receipts[operationId]={fingerprint,result:structuredClone(item)};
+      return item;
+    });
+  }
+  async generateDailies() {
+    return this.transact(d=>{
+      const created=[],now=this.clock();
+      for(const template of Object.values(d.dailyTasks??{})) {
+        if(template.deletedAt || !template.enabled)continue;
+        const local=DateTime.fromMillis(now,{zone:template.timeZone});
+        if(local.hour<8)continue;
+        const date=local.toISODate(),marker=`${template.id}:${date}`,id=`daily_${template.id}_${date.replaceAll('-','')}`;
+        if(d.dailyGenerations?.[marker])continue;
+        const existing=d.items[id];
+        if(existing) {
+          if(existing.dailyTaskId!==template.id || existing.dailyDate!==date)throw problem('Generated daily task ID belongs to another item',409);
+          continue;
+        }
+        if(Object.hasOwn(d.dailyTasks,id))throw problem('Generated daily task ID belongs to a template',409);
+        const normalized=normalizeItem({title:template.title,notes:template.notes,kind:'todo',
+          dueAt:timeOnDate(date,template.defaultStartTime,template.timeZone),durationMinutes:template.defaultDurationMinutes,
+          timeZone:template.timeZone,enabled:true,status:'open',recurrence:null});
+        const saved=writeItem(d,id,normalized,now);
+        saved.dailyTaskId=template.id;saved.dailyDate=date;
+        d.dailyGenerations??={};d.dailyGenerations[marker]=id;
+        created.push(saved);
+      }
+      return created;
     });
   }
 }

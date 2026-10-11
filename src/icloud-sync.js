@@ -5,6 +5,16 @@ import {syncWindow,withinWindow} from './sync-window.js';
 
 const stateOf = d => d.syncClients.icloud;
 const stripStatus = title => title.replace(/^(?:✓ |⏸ )/, '');
+const occurrenceOwner = key => typeof key==='string' ? /^(.*):\d+@/.exec(key)?.[1] : undefined;
+function unmanagedProperties(event) {
+  const component=event.root?.getFirstSubcomponent('vevent');
+  if(!component)return null;
+  const managed=new Set(['summary','description','dtstart','dtend','duration','x-dsh-timezone','dtstamp','last-modified','created','sequence']);
+  return {
+    properties:component.getAllProperties().filter(p=>!managed.has(p.name)).map(p=>JSON.stringify(p.toJSON())).sort(),
+    components:component.getAllSubcomponents().map(c=>JSON.stringify(c.toJSON())).sort()
+  };
+}
 export class ICloudSync {
   constructor(store, dav, config, {clock=Date.now,log=()=>{}}={}) {
     this.store=store;this.dav=dav;this.config=config;this.clock=clock;this.log=log;
@@ -82,9 +92,29 @@ export class ICloudSync {
   async queueDelete(id,map) {
     await this.store.transact(d=>{stateOf(d).pending[id]={action:'delete',kind:map.kind,href:map.href,etag:map.etag,uid:map.uid};});
   }
+  isHabitPending(id,p,d) {
+    if(d.items[id]?.kind==='habit')return true;
+    if(p.kind!=='projection' || !p.raw)return false;
+    return d.items[occurrenceOwner(parseEvent(p.raw,this.config.timeZone).occurrence)]?.kind==='habit';
+  }
+  async retireHabitWrites(window) {
+    // Legacy PUTs may already have reached Apple even when their reply was lost.
+    // Turn them into cleanup-only work before the first outbound drain. Keep
+    // out-of-window work archived; a cleanup request can never upload an event.
+    await this.store.transact(d=>{
+      const s=stateOf(d);
+      for(const [id,p] of Object.entries(s.pending)) {
+        if(p.action==='put' && this.isHabitPending(id,p,d))p.action='retire';
+      }
+      for(const [id,map] of Object.entries(s.maps)) {
+        if(map.kind!=='item' || d.items[id]?.kind!=='habit' || s.pending[id] || s.conflicts[id] || !withinWindow(map.base,window))continue;
+        s.pending[id]={action:'retire',kind:map.kind,uid:map.uid,href:map.href,etag:map.etag,fields:map.base};
+      }
+    });
+  }
   async finishPending(id,p,remote) {
     await this.store.transact(d=>{
-      if(p.action==='delete')delete stateOf(d).maps[id];
+      if(p.action!=='put')delete stateOf(d).maps[id];
       else stateOf(d).maps[id]={kind:p.kind,uid:p.uid,href:p.href,etag:remote.etag,revision:p.revision,base:remote.fields,missing:0};
       delete stateOf(d).pending[id];
     });
@@ -96,6 +126,25 @@ export class ICloudSync {
       if(stateOf(this.store.snapshot()).conflicts[id])continue;
       try {
         let remote=this.decode(await this.dav.get(p.href));
+        // Recheck after network I/O in case a user converted the item to a
+        // habit while this cycle was in flight.
+        if(p.action==='retire' || (p.action==='put' && this.isHabitPending(id,p,this.store.snapshot()))) {
+          if(remote) {
+            const map=stateOf(this.store.snapshot()).maps[id];
+            const expected=p.raw?parseEvent(p.raw,this.config.timeZone):null;
+            const managedIdentity=expected && (expected.occurrence?remote.occurrence===expected.occurrence:remote.itemId===id);
+            // Field equality alone misses a later location/alarm edit. Without
+            // a recorded successful-PUT ETag, retain such versions for review.
+            const recoveredPut=managedIdentity && remote.uid===p.uid && equal(remote.fields,p.fields)
+              && equal(unmanagedProperties(remote),unmanagedProperties(expected));
+            const unchangedMap=map && remote.uid===map.uid && remote.href===map.href && remote.etag===p.etag;
+            if(remote.unsupported || !withinWindow(remote.fields,window) || (!recoveredPut && !unchangedMap)) {
+              await this.conflict(id,'旧习惯日历事件已在云端修改，未自动删除',remote);continue;
+            }
+            await this.dav.remove(p.href,remote.etag);
+          }
+          await this.finishPending(id,{...p,action:'retire'},null);continue;
+        }
         if(p.action==='delete') {
           if(remote && remote.etag!==p.etag){await this.conflict(id,'删除前云端事件已经修改',remote);continue;}
           if(remote)await this.dav.remove(p.href,p.etag);
@@ -116,6 +165,7 @@ export class ICloudSync {
   }
   async cycle() {
     const window=this.window();
+    await this.retireHabitWrites(window);
     await this.drainPending(window);
     if(this.closed)return;
     const remote=(await this.dav.list(this.config.calendarUrl,window)).map(o=>this.decode(o)).filter(r=>r.unsupported || withinWindow(r.fields,window));
@@ -133,6 +183,11 @@ export class ICloudSync {
       const id=entry?.[0]??(r.itemId && Object.hasOwn(d.items,r.itemId)?r.itemId:`icloud-${digest(this.config.calendarUrl+r.uid)}`);
       if(s.conflicts[id] || s.pending[id])continue;
       const item=d.items[id],map=entry?.[1];
+      // A previous ordinary event may have been converted into a local-only
+      // habit. Never let its stale cloud copy edit or resurrect that rule.
+      if(item?.kind==='habit') {
+        await this.conflict(id,'习惯仅作本地提醒；未验证的旧云端事件保留待处理',r);continue;
+      }
       if(r.unsupported) {if(map || item)await this.conflict(id,r.unsupported,r);continue;}
       if(!map) {
         if(item) {
@@ -152,6 +207,7 @@ export class ICloudSync {
     for(const [id,map] of Object.entries(stateOf(this.store.snapshot()).maps)) {
       if(map.kind!=='item' || !withinWindow(map.base,window) || remote.some(r=>r.uid===map.uid || r.href===map.href))continue;
       const d=this.store.snapshot(),s=stateOf(d),item=d.items[id];
+      if(item?.kind==='habit')continue;
       if(s.pending[id] || s.conflicts[id])continue;
       if(!item || (!item.deletedAt && item.revision!==map.revision)){await this.conflict(id,'云端删除与本地修改冲突');continue;}
       const found=this.decode(await this.dav.get(map.href));
@@ -172,6 +228,7 @@ export class ICloudSync {
     for(const item of Object.values(this.store.snapshot().items)) {
       if(this.closed)return;
       const id=item.id,s=stateOf(this.store.snapshot()),map=s.maps[id];
+      if(item.kind==='habit')continue;
       if(!withinWindow(item,window) && !withinWindow(map?.base,window))continue;
       if(s.conflicts[id] || s.pending[id] || map?.missing)continue;
       if(item.recurrence){if(map)await this.queueDelete(id,map);continue;}
@@ -187,7 +244,7 @@ export class ICloudSync {
   async syncProjections(remote,window) {
     const d=this.store.snapshot(),wanted=new Map();const now=this.clock();
     for(const item of Object.values(d.items)) {
-      if(!item.recurrence || item.deletedAt || !item.enabled || item.status!=='open')continue;
+      if(item.kind==='habit' || !item.recurrence || item.deletedAt || !item.enabled || item.status!=='open')continue;
       for(const dueAt of occurrencesBetween(item,window.from,window.to-1)) {
         const key=`${item.id}:${item.scheduleVersion}@${dueAt}`,id=`occ-${digest(key)}`;
         const fields=fieldsFor({...item,title:`↻ ${item.title}`,dueAt,status:d.occurrences[key]?.state==='done'?'done':'open'});
@@ -200,7 +257,7 @@ export class ICloudSync {
       if(r?.unsupported){await this.conflict(id,r.unsupported,r);continue;}
       if(r && !map){map={kind:'projection',uid:r.uid,href:r.href,etag:r.etag,revision:equal(r.fields,target.fields)?target.revision:null,base:r.fields};await this.setMap(id,map);}
       if(map && !r){
-        if(await this.dav.get(map.href))throw Error('云端查询暂时遗漏习惯投影');
+        if(await this.dav.get(map.href))throw Error('云端查询暂时遗漏重复事项投影');
         await this.store.transact(d=>{delete stateOf(d).maps[id];});map=null;
       }
       if(!map || map.revision!==target.revision || !equal(r?.fields,target.fields)) {
@@ -212,9 +269,16 @@ export class ICloudSync {
       if(map.kind!=='projection' || wanted.has(id) || !withinWindow(map.base,window))continue;
       const s=stateOf(this.store.snapshot());if(s.pending[id]||s.conflicts[id])continue;
       const r=remote.find(r=>r.href===map.href);
-      if(!r){if(await this.dav.get(map.href))throw Error('云端查询暂时遗漏过期投影');await this.store.transact(d=>{delete stateOf(d).maps[id];});}
+      if(!r){
+        const found=this.decode(await this.dav.get(map.href));
+        if(found){
+          if(found.etag!==map.etag){await this.conflict(id,'过期重复事项投影被手动修改，未自动删除',found);continue;}
+          throw Error('云端查询暂时遗漏过期投影');
+        }
+        await this.store.transact(d=>{delete stateOf(d).maps[id];});
+      }
       else if(r.etag===map.etag)await this.queueDelete(id,map);
-      else await this.conflict(id,'过期习惯投影被手动修改，未自动删除',r);
+      else await this.conflict(id,'过期重复事项投影被手动修改，未自动删除',r);
     }
   }
   async resolve(id,prefer) {
@@ -227,7 +291,7 @@ export class ICloudSync {
   async resolveConflict(id,prefer) {
     const d=this.store.snapshot(),s=stateOf(d),c=s.conflicts[id],map=s.maps[id],p=s.pending[id],item=d.items[id];
     if(!c)throw problem('冲突不存在',404);
-    if(!item || map?.kind==='projection' || p?.kind==='projection')throw problem('该冲突需要先在 iCloud 恢复事件格式或移除重复项，再联系维护者处理');
+    if(!item || item.kind==='habit' || map?.kind==='projection' || p?.kind==='projection')throw problem('该冲突需要先在 iCloud 恢复事件格式或移除重复项，再联系维护者处理');
     const href=map?.href??p?.href??c.remote?.href;
     const remote=href?this.decode(await this.dav.get(href)):null;
     if(!withinWindow(item,this.window()) && !withinWindow(map?.base,this.window()) && !withinWindow(remote?.fields,this.window()))throw problem('该事项在三个月同步范围外，保留归档，暂不处理云端冲突',409);

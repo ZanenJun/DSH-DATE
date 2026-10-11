@@ -32,6 +32,14 @@ export function normalizeItem(input) {
   return out;
 }
 
+function wallTime(item,start) {
+  if(item.kind==='habit' && /^([01]\d|2[0-3]):[0-5]\d$/.test(item.defaultTime??'')) {
+    const [hour,minute]=item.defaultTime.split(':').map(Number);
+    return {hour,minute,second:0,millisecond:0};
+  }
+  return {hour:start.hour,minute:start.minute,second:start.second,millisecond:start.millisecond};
+}
+
 // Enumerate wall-clock dates, not multiples of 24h: DST must not shift a habit's time.
 export function occurrencesBetween(item, from, to, limit = 400) {
   const start = DateTime.fromISO(item.dueAt).setZone(item.timeZone);
@@ -50,7 +58,7 @@ export function occurrencesBetween(item, from, to, limit = 400) {
       ? days >= 0 && days % rule.interval === 0
       : weeks >= 0 && weeks % rule.interval === 0 && (rule.weekdays ?? [start.weekday]).includes(day.weekday);
     if (selected) {
-      const candidate = day.set({ hour: start.hour, minute: start.minute, second: start.second, millisecond: start.millisecond });
+      const candidate = day.set(wallTime(item,start));
       if (+candidate >= +start && +candidate >= from && +candidate <= to && +candidate <= until) results.push(candidate.toUTC().toISO());
     }
     day = day.plus({ days: 1 });
@@ -64,7 +72,7 @@ export function latestDue(item, now) {
   const rule = item.recurrence;
   const end = DateTime.fromMillis(Math.min(now, rule.until ? Date.parse(rule.until) : now)).setZone(item.timeZone);
   if (+end < +start) return null;
-  const atTime = day => day.set({ hour: start.hour, minute: start.minute, second: start.second, millisecond: start.millisecond });
+  const atTime = day => day.set(wallTime(item,start));
   if (rule.frequency === 'daily') {
     const days = Math.floor(end.startOf('day').diff(start.startOf('day'), 'days').days);
     let candidate = atTime(start.startOf('day').plus({ days: Math.floor(days / rule.interval) * rule.interval }));

@@ -50,7 +50,7 @@ try {
     console.log(`Installed into profile ${profile}. Restart DSH; select calendar-assistant in qq-bridge. Backup: ${backup}`);
   } else if (command === 'status') {
     const state = await (await localClient(configFile))('state');
-    console.log(JSON.stringify({now:state.now,qqConnected:state.qqConnected,items:state.items.filter(i=>!i.deletedAt).length,activeReminders:state.occurrences.filter(o=>o.state==='active').length,syncBackend:state.syncBackend,icloud:state.icloud},null,2));
+    console.log(JSON.stringify({now:state.now,qqConnected:state.qqConnected,items:state.items.filter(i=>!i.deletedAt).length,dailyTasks:(state.dailyTasks??[]).filter(i=>!i.deletedAt).length,habits:(state.habits??[]).filter(i=>!i.deletedAt).length,activeReminders:state.occurrences.filter(o=>o.state==='active').length,syncBackend:state.syncBackend,icloud:state.icloud},null,2));
   } else if (command === 'pair') {
     const config = await readConfig(configFile);
     console.log(`Mac URL over an SSH tunnel: http://127.0.0.1:${config.port}`);

@@ -36,9 +36,14 @@ async function body(req) {
 export async function startService(config, options = {}) {
   const store = await new CalendarStore(config.dataDir, { clock: options.clock,timeZone:config.timeZone }).open();
   const diagnostics = { startedAt: new Date().toISOString(), requests: {} };
-  let server, timer, transport, scheduler, cloud, cloudTimer, cloudError=null, cloudReloadPromise=null;
+  let server, timer, routineTimer, routineWork, transport, scheduler, cloud, cloudTimer, cloudError=null, cloudReloadPromise=null;
   const cloudStatus=()=>cloud?.status()??{enabled:!!config.icloud?.enabled,lastError:cloudError};
   const syncFor=(item,data=store.snapshot())=>itemSyncStatus(item,data,{enabled:!!config.icloud?.enabled,available:!!cloud,error:cloudError,now:options.clock?.()??Date.now(),timeZone:config.timeZone});
+  const generateDailies=async({sync=true}={})=>{
+    const created=await store.generateDailies();
+    if(created.length && sync)cloud?.requestSync().catch(()=>options.log?.('每日必做已保存，等待 iCloud 重试'));
+    return created;
+  };
   const syncForTool=async()=>{
     if(!cloud)return {state:config.icloud?.enabled?'unavailable':'disabled'};
     let timeout;
@@ -74,7 +79,7 @@ export async function startService(config, options = {}) {
       send: options.sendHook ?? (async () => { throw Error('Reminder delivery requires the DSH Agent plugin'); }), onEvent: options.onEvent
     });
     server = http.createServer(async (req, res) => {
-      const route = ['/v1/agent/state', '/v1/agent/upsert', '/v1/agent/delete', '/v1/agent/action', '/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
+      const route = ['/v1/agent/routines/upsert', '/v1/agent/routines/delete', '/v1/routines/upsert', '/v1/routines/delete', '/v1/agent/state', '/v1/agent/upsert', '/v1/agent/delete', '/v1/agent/action', '/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
       const client = /DSHCalendarSync|CFNetwork|Darwin/i.test(req.headers['user-agent'] ?? '') ? 'mac' : 'other';
       const method = ['GET', 'POST'].includes(req.method) ? req.method : 'other';
       res.on('finish', () => {
@@ -95,18 +100,22 @@ export async function startService(config, options = {}) {
         if (req.headers.origin) throw problem('Browser origins are not supported', 403);
         if(config.icloud?.enabled && client==='mac')throw problem('已启用 Linux 直连 iCloud。请退出旧 DSH 日历同步程序，使用系统日历的 iCloud 同步。',409);
         const url = new URL(req.url, 'http://127.0.0.1');
-        const agentRoute=['/v1/agent/state','/v1/agent/upsert','/v1/agent/delete','/v1/agent/action'].includes(url.pathname);
+        const agentRoute=['/v1/agent/state','/v1/agent/upsert','/v1/agent/delete','/v1/agent/action','/v1/agent/routines/upsert','/v1/agent/routines/delete'].includes(url.pathname);
         if(agentRoute)url.pathname=url.pathname.replace('/agent/','/');
         if (req.method === 'GET' && url.pathname === '/v1/diagnostics') return reply(200, diagnostics);
         if (req.method === 'GET' && url.pathname === '/v1/icloud/status') return reply(200,cloudStatus());
         if (req.method === 'GET' && url.pathname === '/v1/state') {
+          if(agentRoute)await generateDailies({sync:false});
           const toolSync=agentRoute?await syncForTool():undefined;
           const d = store.snapshot();
           return reply(200, { schemaVersion: 1, revision: d.revision,toolSync,
             now: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).toISO(), timeZone: config.timeZone,
             weekday: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).setLocale('zh-CN').toFormat('cccc'),
             qqConnected: transport.connected === true,syncBackend:config.icloud?.enabled?'icloud':'mac',icloud:cloudStatus(),syncWindow:syncWindow(options.clock?.()??Date.now(),config.timeZone),
-            items: Object.values(d.items).map(i => ({ ...i, dueAtLocal: localTime(i.dueAt, i.timeZone),sync:syncFor(i,d) })),
+            latestUserReply:d.lastReplyAt==null?null:{messageId:d.lastReplyId,at:new Date(d.lastReplyAt).toISOString(),atLocal:localTime(new Date(d.lastReplyAt).toISOString(),config.timeZone)},
+            dailyTasks:Object.values(d.dailyTasks??{}),
+            habits:Object.values(d.items).filter(i=>i.kind==='habit').map(i=>({...i,defaultTime:i.defaultTime??DateTime.fromISO(i.dueAt).setZone(i.timeZone).toFormat('HH:mm'),dueAtLocal:localTime(i.dueAt,i.timeZone),sync:syncFor(i,d)})),
+            items: Object.values(d.items).filter(i=>i.kind!=='habit').map(i => ({ ...i, dueAtLocal: localTime(i.dueAt, i.timeZone),sync:syncFor(i,d) })),
             occurrences: Object.values(d.occurrences).map(o => ({ ...o, dueAtLocal: localTime(o.dueAt, d.items[o.itemId].timeZone) })), memory: calendarMemory(d) });
         }
         if (req.method === 'GET' && url.pathname === '/v1/projections') {
@@ -117,7 +126,7 @@ export async function startService(config, options = {}) {
           if (!Number.isFinite(from) || !Number.isFinite(to) || to < from || to - from > 366 * 86400000) throw problem('Projection range must be <= 366 days');
           const d = store.snapshot(); const events = [];
           for (const item of Object.values(d.items)) {
-            if (!item.recurrence || item.deletedAt || !item.enabled || item.status !== 'open') continue;
+            if (item.kind==='habit' || !item.recurrence || item.deletedAt || !item.enabled || item.status !== 'open') continue;
             for (const dueAt of occurrencesBetween(item, from, to)) {
               const key = `${item.id}:${item.scheduleVersion}@${dueAt}`;
               events.push({ key, itemId: item.id, title: item.title, notes: item.notes, dueAt,
@@ -147,6 +156,14 @@ export async function startService(config, options = {}) {
             if (!options.previewHook) throw problem('Preview requires the DSH plugin', 503);
             return reply(200, await options.previewHook(input));
           }
+          if(url.pathname==='/v1/routines/upsert' || url.pathname==='/v1/routines/delete') {
+            const saved=url.pathname.endsWith('/upsert')?await store.saveRoutine(input):await store.removeRoutine(input);
+            const created=await generateDailies({sync:!agentRoute});
+            const toolSync=agentRoute?await syncForTool():undefined;
+            return reply(200,{...saved,collection:input.collection,
+              sync:input.collection==='habits'?syncFor(saved):{backend:'local',state:'template',message:saved.deletedAt?'每日必做模板已删除；已生成的日历事项保留。':'每日必做模板已保存；每天 08:00 生成普通日历待办，模板本身不上传。'},
+              generated:created.map(i=>({...i,sync:syncFor(i)})),toolSync,icloud:cloudStatus()});
+          }
           if (url.pathname === '/v1/upsert') {
             const saved=await store.upsert(input);
             if(agentRoute){const toolSync=await syncForTool();return reply(200,{...saved,sync:syncFor(saved),toolSync,icloud:cloudStatus()});}
@@ -165,20 +182,28 @@ export async function startService(config, options = {}) {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
     if (options.startTransport !== false) transport.start();
     await reloadCloud(config.icloud).catch(()=>options.log?.(cloudError));
+    await generateDailies();
+    if(options.startTimer!==false){
+      routineTimer=setInterval(()=>{
+        if(routineWork)return;
+        routineWork=generateDailies().catch(()=>options.log?.('每日必做生成失败，将重试')).finally(()=>{routineWork=null;});
+      },1000);routineTimer.unref();
+    }
     if(options.startCloudTimer!==false){cloudTimer=setInterval(()=>cloud?.tick().catch(()=>options.log?.('iCloud 同步状态保存失败')),1000);cloudTimer.unref();}
     if (options.startTimer !== false && options.sendHook) {
       timer = setInterval(() => scheduler.tick().catch(() => options.log?.('Calendar tick failed')), 1000);
       timer.unref();
     }
-    return { store, scheduler, transport, port: server.address().port,
+    return { store, scheduler, transport, generateDailies, port: server.address().port,
       async close() {
-        scheduler.stopped = true; clearInterval(timer);clearInterval(cloudTimer); transport.close();
+        scheduler.stopped = true; clearInterval(timer);clearInterval(routineTimer);clearInterval(cloudTimer); transport.close();
         await new Promise(resolve => server.close(resolve));
+        await routineWork;
         await cloudReloadPromise?.catch(()=>{});
         await cloud?.close();
         while (scheduler.busy) await new Promise(resolve => setTimeout(resolve, 10));
         await store.close();
       }
     };
-  } catch (e) { clearInterval(timer);clearInterval(cloudTimer);await cloud?.close(); transport?.close(); server?.close(); await store.close(); throw e; }
+  } catch (e) { clearInterval(timer);clearInterval(routineTimer);clearInterval(cloudTimer);await routineWork;await cloud?.close(); transport?.close(); server?.close(); await store.close(); throw e; }
 }

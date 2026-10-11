@@ -6,16 +6,20 @@
 
 ## 行为
 
-- 用 QQ 说“明天 9 点提醒我开会”“每天 22 点提醒我整理房间”“每周一、三 19 点运动”。时间不明确时助手会询问。
+- 用 QQ 说“明天 9 点提醒我开会”“添加每日必做：9 点开始学习，持续 45 分钟”“添加习惯：每天 22 点整理房间”。时间或持续时间不明确时助手会询问。
+- **每日必做**在独立 `daily-tasks.json` 保存模板，必填默认开始时间 `defaultStartTime`（HH:mm）和默认持续分钟数 `defaultDurationMinutes`。每天模板所在时区 08:00 后生成当天普通待办，生成的待办同步日历；服务停机后只补当天。同一天同一模板只生成一次，不覆盖已改期的待办，也不重建已删除的当天待办。08:00 是生成时间；如果默认开始时间早于 08:00，生成后按逾期待办处理。
+- **习惯养成**在独立 `habits.json` 保存，必填每日默认时间 `defaultTime`（HH:mm）。只通过 hook 唤起 Agent 口头提醒，不创建日历事件；同样每 30 秒催促直到用户回复，明确完成只完成当次。
 - 到点通过 `calendar-agent/reminder-due` hook 唤起真正的 DSH Agent，根据事项、逾期时长、成功催促次数、上次正文及近期回复生成中文提醒，再给管理员 QQ 发私聊。每次最多合并 20 项，轮转避免遗漏。
 - 无回复时，上次发送后至少 30 秒开始下一次生成；模型耗时会增加实际间隔。语气逐渐直接但不责备。生成期间发生回复、改期、完成、删除或延后，会取消旧稿。
 - 管理员的**任何私聊回复**通过 `calendar-agent/message` hook 暂停所有已提醒事项的当次催促；不会自动标记完成。
 - 明确说“完成 + 事项”才标记完成。只有一个待确认事项时“完成”也可；有多个时助手应询问。习惯只完成当次，下一次照常提醒。
 - “稍后 10 分钟”恢复为延后提醒。修改计划时间会取消旧提醒。
+- 对普通单次事项明确说“开始了”：Agent 用这条 QQ 回复的真实时间更新开始时间，保留原持续时长，结束时间随之顺延，并停止开始催促。普通“收到”“好”只暂停当次提醒，不改起止时间。明确提前结束时保留实际开始、缩短持续时间并完成事项；延后结束时按指定终点调整持续时间。通过现有更新接口操作，持续时间按分钟向上取整、最少 1 分钟；无法确认事项或本条回复时间时先询问。
+- 模板和当天待办分别编辑：修改每日默认安排影响以后生成的待办，修改今天的待办不改变模板；删除模板保留已有日历实例。
 - JSON 保存事项、重复规则、每次提醒状态、版本和删除记录。另保留最近 200 条变更、用户回复和成功催促记录。QQ Agent 每轮自动注入当前事项和最近记忆，换会话或服务重启后也可读取；完整事项仍通过 calendar_list 查询。
-- QQ 或回复监听断开时暂停发送。催促依赖 DSH 默认模型/API；模型失败会记录错误并按间隔重试，不回退到固定文案。停机跨过多个习惯周期只补最近一次。
+- QQ 或回复监听断开时暂停发送。催促依赖 DSH 默认模型/API；模型失败会记录错误并按间隔重试，不回退到固定文案。停机后只补当天已到时间的习惯，不追催昨天；用户明确延后到当天或未来的提醒会保留，支持跨午夜。
 - 使用专用「DSH 日历助手」日历。普通待办/事件的标题、备注、起止时间和时区双向同步；iCloud 新建事件作为待办导入。云端删除经两次完整同步及单独读取确认后生效。完成显示 `✓`，完成操作请通过 QQ。
-- 习惯及重复事项只向日历展示上个月、本月和下个月的事件（`↻`）；其修改、删除会在后续同步恢复。**请在 QQ 修改习惯规则**。全天事件、原生重复事件和会议邀请不支持导入。
+- 习惯规则由 QQ 管理，**不写入日历**；旧版本由本插件创建的习惯投影，仅清理当前同步窗口内且未被人工修改的记录；改动过的记录保留为冲突，窗口外归档保留。普通重复事项仍可投影到日历。全天事件、原生日历重复事件和会议邀请不支持导入。
 - 两端同时修改同一事项时保留冲突，不自动覆盖。iCloud 模式用 `icloud-resolve` 选择保留版本；旧 Mac 模式仍在配套应用中处理冲突。
 
 ## iCloud 直连（推荐）
@@ -30,7 +34,7 @@ node bin/calendar.js icloud-status
 
 命令会依次询问 Apple 账户邮箱、App 专用密码（不回显）和专用日历。先在 [Apple 账户页面](https://account.apple.com) 的“登录与安全 → App 专用密码”生成密码，需要开启双重认证。不要填写 Apple 主密码，也不要把密码提交 Git 或发给 Agent。成功配置后自动通知运行中的插件加载；若 DSH 未运行，启动或重启后生效。
 
-选择 iCloud 下的「DSH 日历助手」。Linux ↔ iCloud 双向同步普通事件，iPhone / Mac 使用系统 iCloud 同步。习惯仍由 QQ 管理，云端只同步上个月、本月和下个月的普通事件及习惯投影，窗口随月份滚动。每轮同步结束后等待 20 秒再开始，失败会退避重试；云端及设备网络可能增加延迟。原生重复、全天事件及会议邀请保留在云端，但不导入为待办。
+选择 iCloud 下的「DSH 日历助手」。Linux ↔ iCloud 双向同步普通事件，iPhone / Mac 使用系统 iCloud 同步。习惯只在本地口头提醒；云端同步上个月、本月和下个月的普通事件（含每日必做生成的当天待办），窗口随月份滚动。每轮同步结束后等待 20 秒再开始，失败会退避重试；云端及设备网络可能增加延迟。原生重复、全天事件及会议邀请保留在云端，但不导入为待办。
 
 每次调用日历 MCP 工具会主动请求同步：查询前拉取，保存、删除及提醒操作后同步。工具最多等待 8 秒，慢请求继续在后台运行；返回实际同步状态，网络失败不会撤销已保存的事项。已有旧配置请把 `icloud.intervalMs` 改为 `20000` 并重启 DSH；未指定时默认 20 秒。QQ 催促间隔仍为 30 秒。
 
@@ -70,7 +74,15 @@ node bin/calendar.js install
 
 `init` 不覆盖已有配置。`install` 在 DSH 的 `web` profile 追加 bundle 并备份原 manifest；其他 profile 用 `--profile NAME`。保留本目录，profile 使用本地链接加载插件。重启 DSH，选择 **calendar-assistant（日历与待办助手）**。
 
-qq-bridge 配置：`agentPreset: "calendar-assistant"`；在控制台选择 `chat` 模式，私聊白名单只加入管理员 QQ，群白名单留空且 `allowAllWhenEmpty: false`。关闭 `socialV2.enabled` 与 `slang.enabled`，避免社交角色/黑话任务干扰。机器人与管理员必须是两个不同账号。
+qq-bridge 可使用 `chat` 模式并配置 `agentPreset: "calendar-assistant"`，或选择 `closed-agent` 模式并将 `closedAgentPreset` 设为 `calendar-assistant`；私聊白名单只加入管理员 QQ，群白名单留空且 `allowAllWhenEmpty: false`。关闭 `socialV2.enabled` 与 `slang.enabled`，避免社交角色/黑话任务干扰。机器人与管理员必须是两个不同账号。
+
+为“开始了/提前结束”绑定当前 QQ 消息的真实时间，在插件目录执行一次桥接适配安装：
+
+```bash
+node bin/qq-context-setup.js /absolute/path/to/qq-bridge
+```
+
+命令只修改已识别版本的私聊消息入口，备份完整原文件并保留其他本地修改；重复执行不重复插入，未知版本会拒绝修改。完成后重启 qq-bridge。该适配对上述两种模式下的 `calendar-assistant` 管理员私聊生效，在用户正文前携带原始消息 ID 和发送时间；手机语音转写等待不改变时间。桥接更新后可重新运行检查。没有这份元数据时，Agent 只能在历史中唯一匹配当前消息，否则会询问实际时间，不使用模型处理时间代替。
 
 配置默认位于 `$DSH_HOME/calendar-agent/config.json`（DSH_HOME 未指定时 `~/.dsh`）。支持 `DSH_CALENDAR_CONFIG` 指定其他路径；需要同时传入 **DSH 服务环境**，不能只在安装终端设置。可编辑时区、端口及 OneBot 的 HTTP/WS 地址；仅允许回环地址，远程服务用 SSH 转发。其他 OneBot 实现可以用独立 `httpTokenFile` / `wsTokenFile`。
 
@@ -97,9 +109,9 @@ DSH preset 已自动通过 stdio 连接本插件 MCP。其他 MCP 客户端也�
 }
 ```
 
-MCP 只在标准输出传协议消息；工具为 `calendar_list`、`calendar_save`、`calendar_delete`、`calendar_reminder`。独立运行 `node bin/calendar.js serve` 仅提供数据服务和同步接口；Agent 催促需要在 DSH 中加载本插件。DSH 内的名字加前缀 `mcp__calendar__`。
+MCP 只在标准输出传协议消息；工具为 `calendar_list`、`calendar_save`、`calendar_delete`、`calendar_reminder`、`routine_save`、`routine_delete`。`calendar_list` 分开返回普通事项、每日必做模板和习惯；新增的 routine 工具只管理模板或习惯规则。独立运行 `node bin/calendar.js serve` 仅提供数据服务和同步接口；Agent 催促需要在 DSH 中加载本插件。DSH 内的名字加前缀 `mcp__calendar__`。
 
-可在本地配置文件增加 `reminder: { "tone": "亲切简短，未回复时更直接", "timeoutMs": 45000 }`，重启 DSH 后生效。提醒 Agent 使用 DSH 默认模型，没有写入或发送工具；生成成功后由 hook 核验最新状态再投递。对话 Agent 保留四个日历 MCP 工具。
+可在本地配置文件增加 `reminder: { "tone": "亲切简短，未回复时更直接", "timeoutMs": 45000 }`，重启 DSH 后生效。提醒 Agent 使用 DSH 默认模型，没有写入或发送工具；生成成功后由 hook 核验最新状态再投递。对话 Agent 保留六个日历与规则 MCP 工具。
 
 ## 旧 Mac 后端接入（仅未启用 iCloud 直连时）
 
@@ -116,7 +128,7 @@ ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
 
 ## 数据和同步协议
 
-见 [协议及 hook](docs/PROTOCOL.md)。`data/calendar/YYYY-MM.json` 按配置时区的开始月份保存事项和提醒状态；聊天与催促正文在 `data/history.json`，同步映射、幂等记录等运行元数据在 `data/state.json`。`data/calendar.json` 现在只是月份索引。`data/backup/` 保留上一次提交的分文件快照，迁移前的原文件保存在 `data/legacy/`。单进程拥有写锁，所有写入排队；持久事务日志确保跨月移动可在重启后恢复。详见 [分月存储与迁移](docs/STORAGE.md)。不要在服务运行时直接改 JSON。手动修复前停止 DSH、备份整个数据目录，再编辑或恢复。
+见 [协议及 hook](docs/PROTOCOL.md)。`data/calendar/YYYY-MM.json` 按配置时区的开始月份保存普通事项和提醒状态；每日必做模板在 `data/daily-tasks.json`，习惯规则及习惯提醒状态在 `data/habits.json`；聊天与催促正文在 `data/history.json`，同步映射、幂等记录等运行元数据在 `data/state.json`。`data/calendar.json` 现在只是月份索引。`data/backup/` 保留上一次提交的分文件快照，迁移前的原文件保存在 `data/legacy/`。单进程拥有写锁，所有写入排队；持久事务日志确保跨月移动可在重启后恢复。详见 [分月存储与迁移](docs/STORAGE.md)。不要在服务运行时直接改 JSON。手动修复前停止 DSH、备份整个数据目录，再编辑或恢复。
 
 项目为个人单用户、小规模日历设计；历史和幂等记录当前不自动清理。默认时区 Asia/Shanghai；按日历墙钟计算每日/每周重复，支持夏令时。精确执行时间受服务器调度、网络和 QQ 平台影响。消息已被 QQ 接收但写盘前崩溃时，恢复后可能重复一次，不承诺恰好一次发送。
 
@@ -131,7 +143,7 @@ npm test
 npm pack
 ```
 
-测试覆盖真实 stdio MCP、API 鉴权、CAS/幂等/删除、催促间隔、生成中回复/改期/完成/删除/延后的旧稿取消、模型失败、持久记忆、身份与重放、习惯周期、夏令时和重启；以及 CalDAV 发现、重定向、条件写入、断网恢复、双端冲突和迁移接管。自动测试使用临时目录、模拟 QQ 和模拟 Apple 协议响应。GitHub Actions 编译 Mac；真实 iCloud 账户和 EventKit 行为仍需实机验收。
+测试覆盖真实 stdio MCP、API 鉴权、CAS/幂等/删除、催促间隔、生成中回复/改期/完成/删除/延后的旧稿取消、模型失败、持久记忆、身份与重放、习惯周期、夏令时和重启；以及每日必做幂等生成、规则分文件存储、习惯仅口头提醒、CalDAV 发现、重定向、条件写入、断网恢复、双端冲突和迁移接管。自动测试使用临时目录、模拟 QQ 和模拟 Apple 协议响应。GitHub Actions 编译 Mac；真实 iCloud 账户和 EventKit 行为仍需实机验收。
 
 ## 卸载
 

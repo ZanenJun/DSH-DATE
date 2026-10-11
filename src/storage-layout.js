@@ -2,7 +2,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {DateTime} from 'luxon';
 
-const validName=name=>['calendar.json','state.json','history.json'].includes(name)||/^calendar\/\d{4}-\d{2}\.json$/.test(name);
+const collectionFiles=['daily-tasks.json','habits.json'];
+const validName=name=>['calendar.json','state.json','history.json',...collectionFiles].includes(name)||/^calendar\/\d{4}-\d{2}\.json$/.test(name);
+const dictionary=value=>value!==null && typeof value==='object' && !Array.isArray(value);
+function validateLayout(index) {
+  if(index.layoutVersion===undefined && index.collections===undefined)return false;
+  if(index.layoutVersion!==2 || !Array.isArray(index.collections)
+    || JSON.stringify(index.collections)!==JSON.stringify(collectionFiles))throw Error('Unsupported calendar collection layout');
+  return true;
+}
 export function partition(data,timeZone,knownMonths=[]) {
   const months=Object.fromEntries(knownMonths.map(month=>[month,{schemaVersion:1,month,items:{},occurrences:{}}]));
   const monthFor=iso=>{
@@ -10,16 +18,22 @@ export function partition(data,timeZone,knownMonths=[]) {
     if(!/^\d{4}-\d{2}$/.test(month))throw Error('Invalid calendar month');
     return months[month]??={schemaVersion:1,month,items:{},occurrences:{}};
   };
-  for(const [id,item] of Object.entries(data.items))monthFor(item.dueAt).items[id]=item;
+  const habits={schemaVersion:1,items:{},occurrences:{}};
+  for(const [id,item] of Object.entries(data.items)) {
+    if(item.kind==='habit')habits.items[id]=item;
+    else monthFor(item.dueAt).items[id]=item;
+  }
   const occurrenceTexts={};
   for(const [key,occurrence] of Object.entries(data.occurrences)) {
     const {lastText,...state}=occurrence;
-    monthFor(occurrence.dueAt).occurrences[key]=state;
+    if(data.items[occurrence.itemId]?.kind==='habit')habits.occurrences[key]=state;
+    else monthFor(occurrence.dueAt).occurrences[key]=state;
     if(lastText!==undefined)occurrenceTexts[key]=lastText;
   }
-  const {items,occurrences,memory=[],schemaVersion,...state}=data;
-  const index={schemaVersion:2,revision:data.revision,timeZone,months:Object.keys(months).sort()};
+  const {items,occurrences,dailyTasks={},memory=[],schemaVersion,...state}=data;
+  const index={schemaVersion:2,layoutVersion:2,collections:collectionFiles,revision:data.revision,timeZone,months:Object.keys(months).sort()};
   return {'calendar.json':index,'state.json':{schemaVersion:1,...state},'history.json':{schemaVersion:1,memory,occurrenceTexts},
+    'daily-tasks.json':{schemaVersion:1,items:dailyTasks},'habits.json':habits,
     ...Object.fromEntries(Object.entries(months).map(([m,v])=>[`calendar/${m}.json`,v]))};
 }
 export function assemble(parts) {
@@ -27,19 +41,33 @@ export function assemble(parts) {
   if(index?.schemaVersion!==2 || !Array.isArray(index.months) || !Number.isInteger(index.revision)
     || state?.schemaVersion!==1 || state.revision!==index.revision || history?.schemaVersion!==1
     || !Array.isArray(history.memory) || !history.occurrenceTexts)throw Error('Invalid partitioned calendar state');
-  const data={...state,schemaVersion:1,items:{},occurrences:{},memory:history.memory};
+  const separated=validateLayout(index);
+  const data={...state,schemaVersion:1,items:{},occurrences:{},dailyTasks:{},memory:history.memory};
+  const addPart=part=>{
+    for(const [id,item] of Object.entries(part.items)) {
+      if(Object.hasOwn(data.items,id))throw Error('Duplicate item across calendar collections');
+      data.items[id]=item;
+    }
+    for(const [key,value] of Object.entries(part.occurrences)) {
+      if(Object.hasOwn(data.occurrences,key))throw Error('Duplicate reminder across calendar collections');
+      data.occurrences[key]={...value,...(Object.hasOwn(history.occurrenceTexts,key)?{lastText:history.occurrenceTexts[key]}:{})};
+    }
+  };
   for(const month of index.months) {
     if(!/^\d{4}-\d{2}$/.test(month))throw Error('Invalid calendar month index');
     const part=parts[`calendar/${month}.json`];
     if(part?.schemaVersion!==1 || part.month!==month || !part.items || !part.occurrences)throw Error('Missing or invalid monthly calendar');
-    for(const [id,item] of Object.entries(part.items)) {
-      if(Object.hasOwn(data.items,id))throw Error('Duplicate item across calendar months');
-      data.items[id]=item;
-    }
-    for(const [key,value] of Object.entries(part.occurrences)) {
-      if(Object.hasOwn(data.occurrences,key))throw Error('Duplicate reminder across calendar months');
-      data.occurrences[key]={...value,...(Object.hasOwn(history.occurrenceTexts,key)?{lastText:history.occurrenceTexts[key]}:{})};
-    }
+    if(separated && Object.values(part.items).some(item=>item.kind==='habit'))throw Error('Habit stored outside habits.json');
+    addPart(part);
+  }
+  if(separated) {
+    const daily=parts['daily-tasks.json'],habits=parts['habits.json'];
+    if(daily?.schemaVersion!==1 || !dictionary(daily.items) || habits?.schemaVersion!==1
+      || !dictionary(habits.items) || !dictionary(habits.occurrences)
+      || Object.values(habits.items).some(item=>item.kind!=='habit'))throw Error('Missing or invalid routine collection');
+    addPart(habits);
+    if(Object.keys(daily.items).some(id=>Object.hasOwn(data.items,id)))throw Error('Duplicate item across calendar and daily tasks');
+    data.dailyTasks=daily.items;
   }
   return data;
 }
@@ -60,13 +88,14 @@ export function readStorageSync(directory) {
       if(index.schemaVersion===1)return {data:index,parts:null};
       if(index.schemaVersion!==2 || !Array.isArray(index.months))throw Error('Unsupported calendar data schema');
       const parts={'calendar.json':index,'state.json':read('state.json'),'history.json':read('history.json')};
+      if(validateLayout(index))for(const file of collectionFiles)parts[file]=read(file);
       for(const month of index.months) {
         if(!/^\d{4}-\d{2}$/.test(month))throw Error('Invalid month path');
         parts[`calendar/${month}.json`]=read(`calendar/${month}.json`);
       }
       try {const committed=validateJournal(read('.transaction.json'));return {data:assemble(committed),parts:committed};}
       catch(e){if(e.code!=='ENOENT')throw e;}
-      if(read('calendar.json').revision!==index.revision)continue;
+      if(JSON.stringify(read('calendar.json'))!==JSON.stringify(index))continue;
       return {data:assemble(parts),parts};
     }catch(e){if(attempt===4)throw e;}
   }
