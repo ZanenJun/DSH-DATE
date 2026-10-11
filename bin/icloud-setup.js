@@ -53,12 +53,12 @@ export async function setupICloud(configFile) {
     const raw=JSON.parse(await fs.readFile(configFile,'utf8'));
     await fs.copyFile(configFile,`${configFile}.before-icloud-${Date.now()}`);
     await atomicJSON(creds,{username,password});
-    raw.icloud={enabled:true,intervalMs:10000,credentialsFile:creds,calendarUrl};
+    raw.icloud={enabled:true,intervalMs:20000,credentialsFile:creds,calendarUrl};
     await atomicJSON(configFile,raw);
     try {
       const api=await localClient(configFile);const status=await api('icloud/reload',{});
       if(status.lastError)throw Error('reload failed');
-      console.log('配置已保存，Linux 已启用直连 iCloud，每 10 秒启动一轮同步。请退出旧 Mac 同步程序；系统日历继续正常使用。');
+      console.log('配置已保存，Linux 已启用直连 iCloud，每轮结束后等待 20 秒再同步。请退出旧 Mac 同步程序；系统日历继续正常使用。');
       console.log('查看同步结果：dsh-calendar icloud-status（或 node bin/calendar.js icloud-status）');
     } catch { console.log('配置已保存。请重启 DSH 使配置生效，再运行 icloud-status 检查连接。'); }
   }finally{dav.close();}

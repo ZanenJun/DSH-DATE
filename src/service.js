@@ -39,6 +39,18 @@ export async function startService(config, options = {}) {
   let server, timer, transport, scheduler, cloud, cloudTimer, cloudError=null, cloudReloadPromise=null;
   const cloudStatus=()=>cloud?.status()??{enabled:!!config.icloud?.enabled,lastError:cloudError};
   const syncFor=(item,data=store.snapshot())=>itemSyncStatus(item,data,{enabled:!!config.icloud?.enabled,available:!!cloud,error:cloudError,now:options.clock?.()??Date.now(),timeZone:config.timeZone});
+  const syncForTool=async()=>{
+    if(!cloud)return {state:config.icloud?.enabled?'unavailable':'disabled'};
+    let timeout;
+    try {
+      const finished=cloud.requestSync().then(()=>({state:cloudStatus().lastError?'error':'finished'}),()=>({state:'error'}));
+      // Slow Apple requests keep running; never turn a committed local write
+      // into a tool failure merely because the network exceeded this budget.
+      return await Promise.race([finished,new Promise(resolve=>{
+        timeout=setTimeout(()=>resolve({state:'running'}),options.toolSyncWaitMs??8000);
+      })]);
+    }finally{clearTimeout(timeout);}
+  };
   const reloadCloud=next=>{
     if(cloudReloadPromise)throw problem('正在加载 iCloud 配置，请稍后重试',409);
     cloudReloadPromise=(async()=>{
@@ -62,7 +74,7 @@ export async function startService(config, options = {}) {
       send: options.sendHook ?? (async () => { throw Error('Reminder delivery requires the DSH Agent plugin'); }), onEvent: options.onEvent
     });
     server = http.createServer(async (req, res) => {
-      const route = ['/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
+      const route = ['/v1/agent/state', '/v1/agent/upsert', '/v1/agent/delete', '/v1/agent/action', '/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
       const client = /DSHCalendarSync|CFNetwork|Darwin/i.test(req.headers['user-agent'] ?? '') ? 'mac' : 'other';
       const method = ['GET', 'POST'].includes(req.method) ? req.method : 'other';
       res.on('finish', () => {
@@ -83,11 +95,14 @@ export async function startService(config, options = {}) {
         if (req.headers.origin) throw problem('Browser origins are not supported', 403);
         if(config.icloud?.enabled && client==='mac')throw problem('已启用 Linux 直连 iCloud。请退出旧 DSH 日历同步程序，使用系统日历的 iCloud 同步。',409);
         const url = new URL(req.url, 'http://127.0.0.1');
+        const agentRoute=['/v1/agent/state','/v1/agent/upsert','/v1/agent/delete','/v1/agent/action'].includes(url.pathname);
+        if(agentRoute)url.pathname=url.pathname.replace('/agent/','/');
         if (req.method === 'GET' && url.pathname === '/v1/diagnostics') return reply(200, diagnostics);
         if (req.method === 'GET' && url.pathname === '/v1/icloud/status') return reply(200,cloudStatus());
         if (req.method === 'GET' && url.pathname === '/v1/state') {
+          const toolSync=agentRoute?await syncForTool():undefined;
           const d = store.snapshot();
-          return reply(200, { schemaVersion: 1, revision: d.revision,
+          return reply(200, { schemaVersion: 1, revision: d.revision,toolSync,
             now: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).toISO(), timeZone: config.timeZone,
             weekday: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).setLocale('zh-CN').toFormat('cccc'),
             qqConnected: transport.connected === true,syncBackend:config.icloud?.enabled?'icloud':'mac',icloud:cloudStatus(),syncWindow:syncWindow(options.clock?.()??Date.now(),config.timeZone),
@@ -134,10 +149,14 @@ export async function startService(config, options = {}) {
           }
           if (url.pathname === '/v1/upsert') {
             const saved=await store.upsert(input);
+            if(agentRoute){const toolSync=await syncForTool();return reply(200,{...saved,sync:syncFor(saved),toolSync,icloud:cloudStatus()});}
             return reply(200,{...saved,sync:syncFor(saved)});
           }
-          if (url.pathname === '/v1/delete') return reply(200, await store.remove(input));
-          if (url.pathname === '/v1/action') return reply(200, await scheduler.act(input));
+          if (url.pathname === '/v1/delete' || url.pathname === '/v1/action') {
+            const result=url.pathname==='/v1/delete'?await store.remove(input):await scheduler.act(input);
+            if(agentRoute){const toolSync=await syncForTool();return reply(200,{...result,sync:syncFor(result.item??result),toolSync,icloud:cloudStatus()});}
+            return reply(200,result);
+          }
         }
         throw problem('Not found', 404);
       } catch (e) { reply(errorStatus(e), { error: errorStatus(e) === 500 ? 'Calendar operation failed' : e.message }); }

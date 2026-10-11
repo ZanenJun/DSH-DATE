@@ -23,7 +23,7 @@ Apple 文档：[第三方应用访问日历](https://support.apple.com/en-us/121
 ```json
 {
   "enabled": true,
-  "intervalMs": 10000,
+  "intervalMs": 20000,
   "credentialsFile": "./data/icloud-credentials.json",
   "calendarUrl": "https://p12-caldav.icloud.com/ACCOUNT/calendars/CALENDAR/"
 }
@@ -56,7 +56,7 @@ node bin/calendar.js icloud-resolve ITEM_ID --prefer local
 - 本地修改立即改变 Linux 提醒时间；云端修改在成功拉取后取消旧提醒。网络断开时服务器只能基于最后已知状态提醒，无法知道尚未上传/拉取的改期。
 - 窗口内报告不完整、网络异常、鉴权失败不会当成删除。远端删除需两轮完整窗口扫描，并通过 GET 404 确认；GET 发现原事件只是改期到窗口外时，导入这次改期后归档，不当成删除；本地删除使用 ETag 条件请求。
 - 云端写入前持久化请求，重启后先读回确认，避免丢失 HTTP 响应导致重复创建。网络操作期间本地发生新修改会保留新版本，在下一轮同步。
-- 轮询每轮结束后等待配置的间隔，默认 10 秒。每批最多处理 20 个待发送操作；首次同步大量习惯可能需要多轮，API 限流或设备离线时延迟会更长。
+- 轮询每轮结束后等待配置的间隔，默认 20 秒。每批最多处理 20 个待发送操作；首次同步大量习惯可能需要多轮，API 限流或设备离线时延迟会更长。
 
 窗口外事件和旧习惯投影保留，不主动读取或删除；待重试请求移出窗口后暂停，记录在 `deferredPending`。未来事项进入窗口后才开始同步。跨出窗口的已知事项保留一次必要的 GET/PUT 以完成改期，避免旧时间留在任一端。
 

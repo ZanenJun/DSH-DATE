@@ -18,10 +18,10 @@ const configSchema = z.object({
     timeoutMs: z.number().int().min(1000).max(120000).default(45000)
   }).default({ tone: '像熟悉我的日程助理，亲切、简洁，连续未回复时逐渐直接，但不施压或责备。', timeoutMs: 45000 }),
   icloud: z.object({
-    enabled:z.boolean().default(false),intervalMs:z.number().int().min(10000).max(3600000).default(10000),
+    enabled:z.boolean().default(false),intervalMs:z.number().int().min(10000).max(3600000).default(20000),
     credentialsFile:z.string().optional(),
     calendarUrl:z.string().refine(v=>{try{return appleURL(v).endsWith('/');}catch{return false;}},'Use the discovered iCloud calendar URL').optional()
-  }).refine(v=>!v.enabled || (v.credentialsFile && v.calendarUrl),'启用 iCloud 前请运行 icloud-setup').default({enabled:false,intervalMs:10000}),
+  }).refine(v=>!v.enabled || (v.credentialsFile && v.calendarUrl),'启用 iCloud 前请运行 icloud-setup').default({enabled:false,intervalMs:20000}),
   onebot: z.object({
     ownerQQ: z.string().regex(/^\d+$/), botQQ: z.string().regex(/^\d+$/),
     httpUrl: localURL(['http:', 'https:']).default('http://127.0.0.1:3000'),

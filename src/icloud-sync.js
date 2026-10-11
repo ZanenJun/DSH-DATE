@@ -8,7 +8,7 @@ const stripStatus = title => title.replace(/^(?:✓ |⏸ )/, '');
 export class ICloudSync {
   constructor(store, dav, config, {clock=Date.now,log=()=>{}}={}) {
     this.store=store;this.dav=dav;this.config=config;this.clock=clock;this.log=log;
-    this.inflight=null;this.closed=false;this.failures=0;this.nextAt=0;
+    this.inflight=null;this.requested=null;this.closed=false;this.failures=0;this.nextAt=0;
   }
   status() {
     const d=this.store.snapshot(),s=stateOf(d);
@@ -42,6 +42,18 @@ export class ICloudSync {
       await this.store.transact(d=>{stateOf(d).lastError=message;});this.log(message);
     }).finally(()=>{this.inflight=null;});
     return this.inflight;
+  }
+  // A tool write may occur after the running cycle took its snapshot. Join one
+  // queued follow-up, whose cycle must START after that write was committed.
+  requestSync() {
+    if(this.closed)return Promise.resolve();
+    if(this.requested)return this.requested;
+    const previous=this.inflight??Promise.resolve();
+    this.requested=previous.catch(()=>{}).then(()=>{
+      this.requested=null;
+      return this.tick(true);
+    });
+    return this.requested;
   }
   async conflict(id,reason,remote) {
     await this.store.transact(d=>{stateOf(d).conflicts[id]??={reason,at:new Date(this.clock()).toISOString(),remote:remote?{href:remote.href,etag:remote.etag,raw:remote.raw}:null};});
@@ -234,5 +246,5 @@ export class ICloudSync {
       await this.drainPending();
     }
   }
-  async close() {this.closed=true;this.dav.close();await this.inflight;}
+  async close() {this.closed=true;this.dav.close();await Promise.all([this.inflight,this.requested]);}
 }

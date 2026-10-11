@@ -25,6 +25,8 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 | 方法和路径 | 输入/输出 |
 | --- | --- |
 | GET /v1/state | 当前时间、时区、星期、QQ 连接状态、items、occurrences 和 memory，包含删除记录；另含 syncBackend 与 icloud 状态，每项附只读 sync 状态 |
+| GET /v1/agent/state | MCP 查询专用：先请求 iCloud 同步，再返回 state 及 toolSync |
+| POST /v1/agent/upsert、delete、action | MCP 修改专用：输入同对应普通接口，先保存，再请求同步；返回原结果及 sync、icloud、toolSync |
 | POST /v1/reminder-preview | `{itemId?}`；调用真实 DSH Agent 预览正文，返回 text、agentSessionId、dryRun。省略 ID 使用临时示例；不写入待办、不发送 QQ |
 | POST /v1/upsert | `{id, baseRevision, operationId, item}`；创建使用新 ID 与 baseRevision=0，编辑必须保留全部可编辑字段；返回保存事项及当前 sync 状态 |
 | POST /v1/delete | `{id, baseRevision, operationId}`；保存删除记录，取消对应催促 |
@@ -39,13 +41,17 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 
 旧 Mac 客户端每 10 秒先重试已持久化请求，再读取服务器状态，上传本地变更（比较上一次实际展示的 revision），最后应用远端变更。冲突不静默覆盖。普通事件删除须连续两轮缺失；重复事件采用服务器投影。同步窗口与使用限制见 README。启用 iCloud 后，旧 Mac 应用请求返回 409，避免两个同步后端同时运行。
 
+四个日历 MCP 工具使用 `/v1/agent/*`，每次成功查询/修改均主动请求同步，不受后台轮询间隔或失败退避的等待限制。若已有一轮正在执行，则合并排队一轮，保证它在本次保存之后开始，避免只等待旧快照。普通 HTTP 接口保留原来的本地读写行为；非法输入及版本冲突不会触发同步。
+
+工具最多等待同步 8 秒；超时后后台继续，已落盘的操作仍返回成功。`toolSync.state` 为 finished（本轮结束）、running（仍在排队或执行）、error（失败）、disabled（未启用 iCloud）、unavailable（配置启用但未连接）。finished 不代表每条事项成功，仍须查看事项 sync 与 icloud.lastError/conflicts/pending；读工具在未完成时返回本地快照，不能称为最新云端数据。旧 Mac 后端不支持这种主动拉取。后台默认每轮结束后等待 20 秒；QQ 催促仍为 30 秒。
+
 ## iCloud 同步状态（0.2.0）
 
 `state.json` 内的 `syncClients.icloud` 保存账户摘要与日历 URL 绑定、`maps`（UID/href/ETag/本地 revision/最后共同字段）、`pending`（发出前持久化的请求）、`conflicts`（冲突原因及远端副本）和最近状态。不含 Apple 密码；凭据独立保存于权限 600 的文件。导入事项和对应映射在同一存储事务提交。
 
 单个同步循环串行执行：重试 pending → 三个月窗口的 VEVENT REPORT → 比较共同字段及本地 revision → 导入/排队写入 → 更新习惯投影 → 发出条件请求。PUT 创建用 If-None-Match: *，更新/删除用 If-Match: ETag；写入后 GET 校验。收到响应前崩溃时，下轮按 UID 与内容核验是否已经完成，避免重复创建。云端事件删除需连续两轮完整清单缺失且单独 GET 返回 404；请求失败或部分响应不作为删除证据。
 
-默认每轮完成后等待 10 秒，失败退避最多 5 分钟；没有推送订阅或硬实时保证。普通事项在上个月、本月、下个月的窗口读取；原生重复、全天和会议邀请保留在云端而不导入。启用前须阅读 [iCloud 配置及迁移](ICLOUD_SETUP.md)。云端改期通过同一个 store.upsert 导入，因此会更新记忆、scheduleVersion，并取消旧 occurrence 及正在生成的旧提醒。
+默认每轮完成后等待 20 秒，失败退避最多 5 分钟；没有推送订阅或硬实时保证。普通事项在上个月、本月、下个月的窗口读取；原生重复、全天和会议邀请保留在云端而不导入。启用前须阅读 [iCloud 配置及迁移](ICLOUD_SETUP.md)。云端改期通过同一个 store.upsert 导入，因此会更新记忆、scheduleVersion，并取消旧 occurrence 及正在生成的旧提醒。
 
 `syncWindow` 返回范围的时区、三个自然月、起点（含）和终点（不含）。窗口滚动不等于删除；已知事件消失需读取确认是否跨出边界，跨界改期完成一次后停止跟踪。未来/过去归档事项不自动同步。
 

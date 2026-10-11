@@ -11,13 +11,15 @@ import {encodeEvent,parseEvent,fieldsFor} from '../src/icloud-codec.js';
 import {startService,tokenFor} from '../src/service.js';
 import {readConfig} from '../src/config.js';
 import {syncWindow,withinWindow} from '../src/sync-window.js';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const base='https://p12-caldav.icloud.com/123/calendars/dsh/';
 const at=Date.parse('2026-10-11T07:00:00Z');
 const item=(extra={})=>({title:'学习',notes:'',dueAt:new Date(at).toISOString(),durationMinutes:30,timeZone:'Asia/Shanghai',...extra});
 class FakeDAV {
-  credentials={username:'test@example.com'};objects=new Map();puts=0;deletes=0;version=0;
-  async list(url,window){this.lastWindow=window;if(this.listFailure)throw Error('offline');return [...this.objects.values()].filter(x=>{const event=parseEvent(x.raw);return !window || event.unsupported || withinWindow(event.fields,window);}).map(x=>({...x}));}
+  credentials={username:'test@example.com'};objects=new Map();puts=0;deletes=0;version=0;lists=0;
+  async list(url,window){this.lists++;this.lastWindow=window;if(this.listFailure)throw Error('offline');return [...this.objects.values()].filter(x=>{const event=parseEvent(x.raw);return !window || event.unsupported || withinWindow(event.fields,window);}).map(x=>({...x}));}
   async get(href){return this.objects.get(href)??null;}
   async put(href,raw,etag){
     const old=this.objects.get(href);if((old?.etag??null)!==etag)throw Object.assign(Error('CAS'),{status:409});
@@ -327,4 +329,86 @@ test('persisted retry outside the rolling window is retained but not sent or cou
   s.dav.loseResponse=true;await s.sync.tick(true);assert.equal(s.sync.status().pending,1);
   s.setNow(Date.parse('2026-11-01T00:00:00Z'));let reads=0;const get=s.dav.get.bind(s.dav);s.dav.get=async(...args)=>{reads++;return get(...args);};
   await s.sync.tick(true);assert.equal(reads,0);assert.equal(s.sync.status().pending,0);assert.equal(s.sync.status().deferredPending,1);assert.equal(s.dav.puts,1);
+});
+
+async function toolFixture(t, options={}) {
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'icloud-tool-test-')),dav=new FakeDAV();
+  const file=path.join(dir,'config.json');
+  const raw={dataDir:dir,port:0,onebot:{ownerQQ:'1',botQQ:'2',configFile:'onebot.json'},
+    icloud:{enabled:true,calendarUrl:base,credentialsFile:'credentials.json'}};
+  await fs.writeFile(file,JSON.stringify(raw));
+  const config=await readConfig(file);
+  const svc=await startService(config,{clock:()=>at,cloudDAV:dav,startCloudTimer:false,startTimer:false,startTransport:false,transport:{close(){}},...options});
+  await fs.writeFile(file,JSON.stringify({...raw,port:svc.port}));
+  const client=new Client({name:'test',version:'1'});
+  t.after(async()=>{await client.close();await svc.close();await fs.rm(dir,{recursive:true,force:true});});
+  await client.connect(new StdioClientTransport({command:process.execPath,args:[path.resolve('src/mcp.js'),file],stderr:'pipe'}));
+  const call=async(name,args={})=>{
+    const result=await client.callTool({name,arguments:args});
+    assert.ok(!result.isError,JSON.stringify(result));return JSON.parse(result.content[0].text);
+  };
+  return {dav,svc,call,config};
+}
+test('all four stdio MCP tools automatically sync: read imports and each write exports',async t=>{
+  const {dav,call,config}=await toolFixture(t);
+  assert.equal(config.icloud.intervalMs,20000);
+  const href=dav.seed('from-apple',item());
+  const state=await call('calendar_list');
+  assert.equal(state.toolSync.state,'finished');assert.equal(state.items.length,1);assert.equal(dav.lists,1);
+  dav.edit(href,{title:'Apple edit'});
+  assert.equal((await call('calendar_list')).items[0].title,'Apple edit');
+  const saved=await call('calendar_save',{id:'from-agent',item:item()});
+  assert.equal(saved.sync.state,'synced');assert.equal(dav.objects.size,2);assert.equal(dav.lists,3);
+  const done=await call('calendar_reminder',{action:'complete',itemId:saved.id});
+  assert.equal(done.sync.state,'synced');assert.equal(dav.lists,4);
+  assert.ok([...dav.objects.values()].some(o=>parseEvent(o.raw).fields.title.startsWith('✓ ')));
+  const deleted=await call('calendar_delete',{id:saved.id,baseRevision:done.item.revision});
+  assert.ok(deleted.deletedAt);assert.equal(deleted.toolSync.state,'finished');assert.equal(dav.objects.size,1);assert.equal(dav.lists,5);
+});
+test('cloud failures do not turn committed MCP writes into errors and later tools bypass backoff',async t=>{
+  const {dav,svc,call}=await toolFixture(t);
+  dav.listFailure=true;
+  const request={id:'offline',operationId:'offline-op',item:item()};
+  const saved=await call('calendar_save',request);
+  assert.equal(saved.toolSync.state,'error');assert.equal(saved.sync.state,'error');
+  assert.equal(Object.keys(svc.store.snapshot().items).length,1);
+  const local=await call('calendar_list');assert.equal(local.items.length,1);assert.equal(local.toolSync.state,'error');
+  dav.listFailure=false;
+  const retry=await call('calendar_save',request);
+  assert.equal(retry.id,saved.id);assert.equal(retry.revision,saved.revision);assert.equal(retry.sync.state,'synced');assert.equal(dav.objects.size,1);
+});
+test('slow sync returns saved MCP result within budget and completes in the background',async t=>{
+  const {dav,svc,call,config}=await toolFixture(t,{toolSyncWaitMs:30});
+  const original=dav.list.bind(dav);let release;
+  const blocked=new Promise(resolve=>{release=resolve;});
+  dav.list=async(...args)=>{await blocked;return original(...args);};
+  // Always release the cloud request before teardown, including on assertion failure.
+  try {
+    const saved=await call('calendar_save',{id:'slow',item:item()});
+    assert.equal(saved.toolSync.state,'running');assert.equal(saved.sync.state,'pending');assert.equal(saved.icloud.running,true);
+  }finally{release();}
+  await fetch(`http://127.0.0.1:${svc.port}/v1/icloud/sync`,{method:'POST',headers:{Authorization:`Bearer ${await tokenFor(config.dataDir)}`,'Content-Type':'application/json'},body:'{}'});
+  const state=await call('calendar_list');assert.equal(state.items[0].sync.state,'synced');
+});
+test('tool requests coalesce after a running cycle and include writes committed after its snapshot',async t=>{
+  const s=await fixture(t);let release,started;
+  const startedPromise=new Promise(resolve=>{started=resolve;});
+  const blocked=new Promise(resolve=>{release=resolve;});
+  const original=s.sync.cycle.bind(s.sync);let cycles=0;
+  s.sync.cycle=async()=>{cycles++;await original();if(cycles===1){started();await blocked;}};
+  const running=s.sync.tick(true);await startedPromise;
+  try {
+    await s.store.upsert({id:'late-write',item:item()});
+    const first=s.sync.requestSync(),second=s.sync.requestSync();
+    assert.strictEqual(first,second);assert.equal(s.dav.objects.size,0);
+    release();await Promise.all([running,first,second]);
+    assert.equal(cycles,2);assert.equal(s.dav.objects.size,1);
+  }finally{release();}
+});
+test('20 second polling waits after completion while tool requests trigger immediately',async t=>{
+  const s=await fixture(t);s.sync.config.intervalMs=20000;
+  await s.sync.tick();assert.equal(s.dav.lists,1);
+  s.setNow(at+19999);await s.sync.tick();assert.equal(s.dav.lists,1);
+  s.setNow(at+20000);await s.sync.tick();assert.equal(s.dav.lists,2);
+  await s.sync.requestSync();assert.equal(s.dav.lists,3);
 });
