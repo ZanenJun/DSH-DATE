@@ -1,0 +1,57 @@
+{
+  "name": "dsh-calendar-agent",
+  "version": "0.1.2",
+  "description": "Private QQ calendar, tasks and habit reminders for DeepSeek Harness, with stdio MCP and macOS Calendar sync",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "main": "src/plugin.js",
+  "exports": {
+    ".": "./src/plugin.js",
+    "./preset": "./src/preset.js"
+  },
+  "bin": {
+    "dsh-calendar": "bin/calendar.js",
+    "dsh-calendar-mcp": "src/mcp.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "files": [
+    "src",
+    "bin",
+    "mac",
+    "docs",
+    "examples",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "test"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "check": "node bin/check.js"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.1",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "luxon": "3.7.2",
+    "ws": "8.18.3",
+    "zod": "4.4.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-mcp-client": "0.2.0-rc.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZanenJun/DSH-DATE.git"
+  },
+  "homepage": "https://github.com/ZanenJun/DSH-DATE#readme",
+  "bugs": {
+    "url": "https://github.com/ZanenJun/DSH-DATE/issues"
+  }
+}

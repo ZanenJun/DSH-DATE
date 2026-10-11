@@ -1,0 +1,27 @@
+name: Check
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+  mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash mac/build.sh
+      - name: Package Mac app
+        run: ditto -c -k --sequesterRsrc --keepParent "mac/build/DSH 日历同步.app" mac/build/DSH-Calendar-Sync-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DSH-Calendar-Sync-macOS
+          path: mac/build/DSH-Calendar-Sync-macOS.zip
+          retention-days: 14

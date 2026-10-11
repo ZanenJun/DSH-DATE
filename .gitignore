@@ -1,0 +1,18 @@
+node_modules/
+state/
+*.tgz
+mac/build/
+.DS_Store
+*.local.json
+
+# Local credentials and runtime data must stay outside Git.
+data/
+.env
+.env.*
+!.env.example
+access-token
+*TokenFile
+*.pem
+*.key
+*.zip
+*.tar.gz

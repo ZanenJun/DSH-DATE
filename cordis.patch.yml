@@ -1,0 +1,15 @@
+- insert:
+    - id: calendar-agent-service
+      name: dsh-calendar-agent
+      config: {}
+    - id: preset-calendar-assistant
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: calendar-assistant
+        name: 日历与待办助手
+        description: QQ 日历、待办、习惯提醒与 Mac 日历同步
+        order: 5
+        plugins:
+          - id: calendar-assistant-tools
+            name: dsh-calendar-agent/preset
+            config: {}

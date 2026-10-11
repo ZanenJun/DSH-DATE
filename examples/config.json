@@ -1,0 +1,14 @@
+{
+  "dataDir": "./data",
+  "port": 3217,
+  "timeZone": "Asia/Shanghai",
+  "repeatMs": 30000,
+  "onebot": {
+    "ownerQQ": "10001",
+    "botQQ": "10002",
+    "httpUrl": "http://127.0.0.1:3000",
+    "wsUrl": "ws://127.0.0.1:3001",
+    "httpTokenFile": "./onebot-http-token",
+    "wsTokenFile": "./onebot-ws-token"
+  }
+}
