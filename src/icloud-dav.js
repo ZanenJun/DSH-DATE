@@ -4,7 +4,7 @@ import { DAVClient } from 'tsdav';
 export function appleURL(value) {
   const u = new URL(value);
   if (u.protocol !== 'https:' || u.username || u.password || u.hash || u.search || (u.port && u.port !== '443')
-    || !(u.hostname === 'caldav.icloud.com' || /^p\d+-caldav\.icloud\.com$/.test(u.hostname) || /^p\d+\.caldav\.icloud\.com$/.test(u.hostname))) throw Object.assign(Error('只允许 Apple iCloud CalDAV HTTPS 地址'),{code:'DAV_UNTRUSTED_URL'});
+    || !/^(?:caldav|p\d+-caldav|p\d+\.caldav)\.icloud\.com(?:\.cn)?$/.test(u.hostname)) throw Object.assign(Error('只允许 Apple iCloud CalDAV HTTPS 地址'),{code:'DAV_UNTRUSTED_URL'});
   return u.href;
 }
 export function cloudError(message, status) { return Object.assign(new Error(message), {status}); }
@@ -84,7 +84,10 @@ export class ICloudDAV {
   }
   async discover() {
     await this.client.login({loadCollections:false,loadObjects:false});
-    return (await this.client.fetchCalendars()).filter(c => !c.components?.length || c.components.includes('VEVENT'))
+    // A global principal may point to a China-region home. Resolve collection
+    // hrefs against the home that returned them, not the original global root.
+    const account={...this.client.account,rootUrl:this.client.account.homeUrl};
+    return (await this.client.fetchCalendars({account})).filter(c => !c.components?.length || c.components.includes('VEVENT'))
       .map(c=>({url:appleURL(c.url),name:typeof c.displayName==='string'?c.displayName:'未命名'}));
   }
   headers(extra={}) { return {Authorization:`Basic ${Buffer.from(`${this.credentials.username}:${this.credentials.password}`).toString('base64')}`,...extra}; }

@@ -1,6 +1,6 @@
 # Linux 直接同步 iCloud 日历
 
-本插件使用 Apple 提供的 App 专用密码认证，经 CalDAV HTTPS 直接访问 `caldav.icloud.com` 及发现的 Apple 日历分区服务器。协议实现采用 tsdav 和 ical.js；它们是开源协议库，并非 Apple 官方 SDK。未模拟 iCloud 网页登录，不保存浏览器 Cookie，也不需要 Apple 主密码。
+本插件使用 Apple 提供的 App 专用密码认证，经 CalDAV HTTPS 直接访问 `caldav.icloud.com` 及发现的 Apple 日历分区服务器，包括中国区 `caldav.icloud.com.cn` / `pNN-caldav.icloud.com.cn`。全球入口发现中国区目录后会继续到该目录查询，无需手动修改地址。仅允许这些 CalDAV 主机及 HTTPS 443，不放开任意 iCloud 子域或第三方地址。协议实现采用 tsdav 和 ical.js；它们是开源协议库，并非 Apple 官方 SDK。未模拟 iCloud 网页登录，不保存浏览器 Cookie，也不需要 Apple 主密码。
 
 Apple 文档：[第三方应用访问日历](https://support.apple.com/en-us/121539)、[生成 App 专用密码](https://support.apple.com/en-us/102654)。协议：[CalDAV RFC 4791](https://www.rfc-editor.org/rfc/rfc4791.html)。
 

@@ -161,6 +161,38 @@ test('CalDAV discovers principal, home and VEVENT calendars across Apple redirec
   assert.deepEqual(await dav.discover(),[{url:base,name:'DSH 日历助手'}]);assert.equal(calls.length,5);
 });
 
+test('global discovery can follow a China calendar home and resolve its relative calendar hrefs',async()=>{
+  const global='https://caldav.icloud.com',regional='https://p231-caldav.icloud.com.cn';
+  const home=regional+'/123/calendars/',calendar=home+'dsh/';const calls=[];
+  const response=(href,props)=>new Response(`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>${href}</d:href><d:propstat><d:prop>${props}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`,{status:207,headers:{'content-type':'application/xml'}});
+  const dav=new ICloudDAV({username:'test@example.com',password:'test'},{fetchImpl:async(url,init)=>{
+    calls.push(url);assert.equal(init.method,'PROPFIND');
+    assert.equal(new Headers(init.headers).get('authorization'),`Basic ${Buffer.from('test@example.com:test').toString('base64')}`);
+    if(url===global+'/.well-known/caldav')return new Response(null,{status:301,headers:{location:global+'/'}});
+    if(url===global+'/')return response('/','<d:current-user-principal><d:href>/123/principal/</d:href></d:current-user-principal>');
+    if(url===global+'/123/principal/')return response('/123/principal/',`<c:calendar-home-set><d:href>${home}</d:href></c:calendar-home-set>`);
+    if(url===home)return response('dsh/','<d:displayname>DSH 日历助手</d:displayname><d:resourcetype><d:collection/><c:calendar/></d:resourcetype><c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>');
+    if(url===calendar)return response('/123/calendars/dsh/','<d:supported-report-set><d:supported-report><d:report><c:calendar-query/></d:report></d:supported-report></d:supported-report-set>');
+    throw Error('Unexpected discovery request');
+  }});
+  assert.deepEqual(await dav.discover(),[{url:calendar,name:'DSH 日历助手'}]);assert.equal(calls.length,5);
+});
+
+test('China-region redirects retain authentication while host lookalikes and unsafe URLs remain blocked',async()=>{
+  for(const host of ['caldav.icloud.com.cn','p231-caldav.icloud.com.cn','p231.caldav.icloud.com.cn'])assert.equal(appleURL(`https://${host}/`),`https://${host}/`);
+  const regional='https://p231-caldav.icloud.com.cn/123/calendars/dsh/item.ics';const calls=[];
+  const dav=new ICloudDAV({username:'test',password:'test'},{fetchImpl:async(url,init)=>{
+    calls.push(url);assert.equal(new Headers(init.headers).get('authorization'),`Basic ${Buffer.from('test:test').toString('base64')}`);
+    if(url===base+'item.ics')return new Response(null,{status:307,headers:{location:regional}});
+    assert.equal(url,regional);return new Response('event',{status:200,headers:{etag:'"1"'}});
+  }});
+  assert.equal((await dav.get(base+'item.ics')).etag,'"1"');assert.equal(calls.length,2);
+  for(const url of ['https://caldav.icloud.com.cn.evil.test/','https://evil-icloud.com.cn/','https://evil.icloud.com.cn/','http://caldav.icloud.com.cn/','https://caldav.icloud.com.cn:8443/','https://user:secret@caldav.icloud.com.cn/','https://caldav.icloud.com.cn/?secret=test']) {
+    await assert.rejects(dav.request(url),e=>e.code==='DAV_UNTRUSTED_URL');
+  }
+  assert.equal(calls.length,2);
+});
+
 test('DAV conditional writes handle empty 204 responses, conflicts and authenticated redirects',async()=>{
   const calls=[];let status=204;
   const dav=new ICloudDAV({username:'test',password:'test'},{fetchImpl:async(url,init)=>{
