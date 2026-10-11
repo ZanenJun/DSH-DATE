@@ -132,6 +132,19 @@ test('real DAV request/response parsing accepts an empty complete report but rej
   xml=`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/123/calendars/dsh/x.ics</d:href><d:propstat><d:prop><d:getetag>"1"</d:getetag><c:calendar-data>${raw}</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`;
   const objects=await dav.list(base);assert.equal(objects.length,1);assert.equal(parseEvent(objects[0].raw).fields.title,'学习');
 });
+
+test('Apple collection metadata is ignored while actual event failures still stop the report',async()=>{
+  const self='<d:response><d:href>/123/calendars/dsh/</d:href><d:propstat><d:prop><d:getetag>"collection"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><c:calendar-data/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response>';
+  const wrap=body=>`<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">${body}</d:multistatus>`;
+  let xml=wrap(self);
+  const dav=new ICloudDAV({username:'test',password:'test'},{fetchImpl:async()=>new Response(xml,{status:207,headers:{'content-type':'application/xml'}})});
+  assert.deepEqual(await dav.list(base),[]);
+  const raw=encodeEvent({uid:'event',fields:item()});
+  const event=`<d:response><d:href>/123/calendars/dsh/event.ics</d:href><d:propstat><d:prop><d:getetag>"1"</d:getetag><c:calendar-data><![CDATA[${raw}]]></c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
+  xml=wrap(self+event);const rows=await dav.list(base);assert.equal(rows.length,1);assert.equal(parseEvent(rows[0].raw).fields.title,'学习');
+  xml=wrap(self+self.replace('/123/calendars/dsh/','/123/calendars/dsh/broken.ics'));await assert.rejects(dav.list(base));
+  xml=wrap(self.replace('404 Not Found','500 Failed'));await assert.rejects(dav.list(base));
+});
 test('cloud mode rejects the legacy Mac writer and exposes status through authenticated API',async t=>{
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'icloud-service-test-')),dav=new FakeDAV();
   const svc=await startService({dataDir:dir,port:0,timeZone:'Asia/Shanghai',onebot:{},icloud:{enabled:true,calendarUrl:base,intervalMs:10000}},
@@ -143,6 +156,23 @@ test('cloud mode rejects the legacy Mac writer and exposes status through authen
   assert.equal((await fetch(url+'icloud/status')).status,401);
   const state=await(await fetch(url+'state',{headers})).json();assert.equal(state.syncBackend,'icloud');
   assert.equal((await fetch(url+'icloud/sync',{method:'POST',headers,body:'{}'})).status,200);
+});
+
+test('save receipts distinguish local storage, verified iCloud revisions, and sync errors',async t=>{
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'icloud-receipt-test-')),dav=new FakeDAV();
+  const svc=await startService({dataDir:dir,port:0,timeZone:'Asia/Shanghai',onebot:{},icloud:{enabled:true,calendarUrl:base,intervalMs:10000}},
+    {cloudDAV:dav,startCloudTimer:false,startTimer:false,startTransport:false,transport:{close(){}}});
+  t.after(async()=>{await svc.close();await fs.rm(dir,{recursive:true,force:true});});
+  const url=`http://127.0.0.1:${svc.port}/v1/`,headers={Authorization:`Bearer ${await tokenFor(dir)}`};
+  const post=async(route,input)=>(await fetch(url+route,{method:'POST',headers,body:JSON.stringify(input)})).json();
+  const state=async()=>(await fetch(url+'state',{headers})).json();
+  const first=await post('upsert',{id:'receipt',item:item()});assert.equal(first.sync.state,'pending');
+  await post('icloud/sync',{});let current=(await state()).items[0];assert.equal(current.sync.state,'synced');assert.equal(current.sync.confirmedRevision,1);
+  const changed=await post('upsert',{id:'receipt',baseRevision:1,item:item({title:'new revision'})});assert.equal(changed.sync.state,'pending');
+  dav.listFailure=true;await post('icloud/sync',{});current=(await state()).items[0];assert.equal(current.sync.state,'error');assert.equal(current.title,'new revision');
+  dav.listFailure=false;await post('icloud/sync',{});current=(await state()).items[0];assert.equal(current.sync.state,'synced');assert.equal(current.sync.confirmedRevision,2);
+  await post('upsert',{id:'legacy-deleted',item:item()});await post('delete',{id:'legacy-deleted',baseRevision:1});
+  const deleted=(await state()).items.find(i=>i.id==='legacy-deleted');assert.equal(deleted.sync.state,'unverified');
 });
 
 test('CalDAV discovers principal, home and VEVENT calendars across Apple redirects',async()=>{

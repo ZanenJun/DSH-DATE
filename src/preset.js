@@ -13,7 +13,9 @@ export async function apply(ctx, config) {
   ctx.systemPrompt.section({ name: 'calendar-time-format', order: 11, interpolate: false,
     text: '事项的 dueAt 是统一 UTC 存储；dueAtLocal 已由服务端按 timeZone 换算，向用户报告时直接用 dueAtLocal。UTC 的 Z 与北京时间相差八小时属于同一时刻的正常表示，不能仅凭这一点声称同步错误或时间填错。dueAtLocal 是只读展示字段，保存 item 时不要传入它。' });
   ctx.systemPrompt.section({name:'calendar-cloud-sync',order:12,interpolate:false,
-    text:'calendar_list 返回 syncBackend 和 icloud 状态。icloud 模式由 Linux 直连 Apple 日历，Mac 无需开机；云端导入的待办与 QQ 新建事项同样属于你的记忆。保存成功只表示 Linux 已保存，只有同步状态才能说明云端同步结果；如有 lastError、pending 或 conflicts，要如实告知，不能声称全部设备已经更新。不要索取或展示 Apple 密码。'});
+    text:'calendar_list 返回 syncBackend、icloud 和每条事项的只读 sync；calendar_save 同样返回该版本的 sync。保存成功只表示 Linux 已保存。sync.state 为 pending 时说“已记录，等待日历同步”；unverified 表示云端状态未确认，按 sync.message 说明，不等同于排队等待上传；为 error/conflict 时明确说“已记录，但日历同步失败/有冲突”。仅该事项 sync.state=synced 时可说“已上传 iCloud”，仍不能声称 iPhone/Mac 已刷新。不能把旧聊天里“已同步”的说法当成证据。sync 和 dueAtLocal 不要传进保存的 item。icloud 模式由 Linux 直连 Apple 日历，Mac 无需开机；云端事项同样属于共享记忆。不要索取或展示 Apple 密码。'});
+  ctx.systemPrompt.section({name:'calendar-overdue',order:13,interpolate:false,
+    text:'过去时间且 enabled=true、status=open 的普通事项会按逾期待办提醒，不能声称“时间已过所以不会催促”。是否暂停以真实 enabled/status 和 occurrence 为准；只有用户明确要求只记录不提醒时才设置 enabled=false。'});
   ctx.systemPrompt.section({ name: 'calendar-memory', order: 20, interpolate: false, text: () => {
     try {
       const data = JSON.parse(fs.readFileSync(path.join(local.dataDir, 'calendar.json'), 'utf8'));

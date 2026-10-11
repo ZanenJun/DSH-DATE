@@ -15,7 +15,7 @@ server.registerTool('calendar_list', {
   description: 'Read current local time, items, revisions, reminder occurrences and persistent shared calendar memory. dueAt is normalized UTC; dueAtLocal is the SAME instant in timeZone, use it when speaking to the user. Always read before editing or interpreting dates. Any QQ reply only acknowledges reminders; it does not complete them.', inputSchema: {}
 }, () => call('state'));
 server.registerTool('calendar_save', {
-  description: 'Create or replace a calendar item. For editing, retain all existing fields and pass its current revision. Dates must include a UTC offset. Habits require daily/weekly recurrence. operationId must be a fresh UUID for each logical edit and reused unchanged on retries.',
+  description: 'Save a calendar item locally on Linux; iCloud upload is asynchronous. Report the returned sync.state accurately: pending/error/conflict is NOT synced. Only sync.state=synced confirms that item revision in iCloud; it never confirms device refresh. For editing, retain editable fields and pass the current revision; omit read-only sync and dueAtLocal. Past open/enabled items can trigger overdue reminders. Dates require a UTC offset; habits require recurrence. Use a fresh operationId per edit and reuse it unchanged on retries.',
   inputSchema: { id: z.string().optional(), baseRevision: z.number().int().min(0).default(0), item: itemInput, operationId: z.string().optional() }
 }, args => call('upsert', args));
 server.registerTool('calendar_delete', {

@@ -24,9 +24,9 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 
 | 方法和路径 | 输入/输出 |
 | --- | --- |
-| GET /v1/state | 当前时间、时区、星期、QQ 连接状态、items、occurrences 和 memory，包含删除记录；另含 syncBackend 与 icloud 状态 |
+| GET /v1/state | 当前时间、时区、星期、QQ 连接状态、items、occurrences 和 memory，包含删除记录；另含 syncBackend 与 icloud 状态，每项附只读 sync 状态 |
 | POST /v1/reminder-preview | `{itemId?}`；调用真实 DSH Agent 预览正文，返回 text、agentSessionId、dryRun。省略 ID 使用临时示例；不写入待办、不发送 QQ |
-| POST /v1/upsert | `{id, baseRevision, operationId, item}`；创建使用新 ID 与 baseRevision=0，编辑必须保留全部可编辑字段 |
+| POST /v1/upsert | `{id, baseRevision, operationId, item}`；创建使用新 ID 与 baseRevision=0，编辑必须保留全部可编辑字段；返回保存事项及当前 sync 状态 |
 | POST /v1/delete | `{id, baseRevision, operationId}`；保存删除记录，取消对应催促 |
 | POST /v1/action | `{action: "complete" 或 "snooze" 或 "acknowledge", itemId, occurrenceKey?, minutes?}` |
 | GET /v1/projections | 习惯展开数组；默认过去 7 天到未来 90 天；可传 from/to ISO 日期，最大跨度 366 天 |
@@ -46,6 +46,10 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 单个同步循环串行执行：重试 pending → 全量 VEVENT REPORT → 比较共同字段及本地 revision → 导入/排队写入 → 更新习惯投影 → 发出条件请求。PUT 创建用 If-None-Match: *，更新/删除用 If-Match: ETag；写入后 GET 校验。收到响应前崩溃时，下轮按 UID 与内容核验是否已经完成，避免重复创建。云端事件删除需连续两轮完整清单缺失且单独 GET 返回 404；请求失败或部分响应不作为删除证据。
 
 默认每轮完成后等待 10 秒，失败退避最多 5 分钟；没有推送订阅或硬实时保证。普通事项全日历读取；原生重复、全天和会议邀请保留在云端而不导入。启用前须阅读 [iCloud 配置及迁移](ICLOUD_SETUP.md)。云端改期通过同一个 store.upsert 导入，因此会更新记忆、scheduleVersion，并取消旧 occurrence 及正在生成的旧提醒。
+
+事项返回的 `sync.state` 为 pending / synced / error / conflict / projection / unverified。普通事项仅在 iCloud 映射已读回确认同一个 revision、没有待发送/缺失/冲突且同步服务状态正常时返回 synced；这个状态不代表设备端已刷新。upsert 的成功只保证 Linux 保存成功，回复用户应依据 sync 状态，不能把 pending 或 error 称为“已同步”。习惯多投影与旧 Mac 后端暂不提供逐版本云端确认。`sync`、`dueAtLocal` 都是只读字段，不要传进保存请求的 item；幂等重试保留原保存结果，其 sync 状态按查询时现状计算。
+
+iCloud REPORT 中可能包含日历目录自身：目录 getetag 为 200，但 calendar-data 为 404。仅忽略与查询目录完全相同且符合此形态的元数据记录；任何真实事件的缺失内容或失败状态仍会中止整轮，避免误删。支持 calendar-data 的文本和 CDATA 表示。
 
 ## DSH hook 与记忆
 

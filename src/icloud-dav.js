@@ -99,12 +99,18 @@ export class ICloudDAV {
       filters:[{'comp-filter':{_attributes:{name:'VCALENDAR'},'comp-filter':{_attributes:{name:'VEVENT'}}}}]});
     const seen=new Set();
     return rows.map(r=>{
-      const raw=r.props?.calendarData,etag=r.props?.getetag;
+      const data=r.props?.calendarData,raw=typeof data==='string'?data:data?._cdata,etag=r.props?.getetag;
+      const href=r.href?appleURL(new URL(r.href,url).href):null;
+      // iCloud includes the calendar collection itself, including when empty:
+      // getetag is 200 but calendar-data is 404 because a directory is not a VEVENT.
+      // Only ignore this exact self-resource shape; missing event data still fails.
+      if(href===url && r.ok && !r.error && !r.parseError && typeof etag==='string' && etag && data===undefined
+        && r.propStats?.some(p=>p.status===404 && Object.hasOwn(p.props??{},'calendarData'))
+        && r.propStats.every(p=>p.ok || (p.status===404 && Object.keys(p.props??{}).length===1 && Object.hasOwn(p.props,'calendarData'))))return null;
       if(!r.ok || r.parseError || !r.href || typeof raw!=='string' || typeof etag!=='string' || !etag || r.propStats?.some(p=>!p.ok))throw Error('iCloud 返回不完整事件清单，已停止本轮同步');
-      const href=appleURL(new URL(r.href,url).href);
       if(!href.startsWith(url) || href===url || seen.has(href))throw Error('iCloud 事件地址无效或重复');
       seen.add(href);return {href,etag,raw};
-    });
+    }).filter(Boolean);
   }
   async get(href) {
     const r=await this.request(href,{method:'GET',headers:this.headers()});

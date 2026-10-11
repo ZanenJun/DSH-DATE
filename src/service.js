@@ -11,6 +11,7 @@ import { calendarMemory, localTime } from './memory.js';
 import { ICloudDAV, loadCloudCredentials } from './icloud-dav.js';
 import { ICloudSync } from './icloud-sync.js';
 import { readConfig } from './config.js';
+import { itemSyncStatus } from './sync-status.js';
 
 export async function tokenFor(directory) {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -36,6 +37,7 @@ export async function startService(config, options = {}) {
   const diagnostics = { startedAt: new Date().toISOString(), requests: {} };
   let server, timer, transport, scheduler, cloud, cloudTimer, cloudError=null, cloudReloadPromise=null;
   const cloudStatus=()=>cloud?.status()??{enabled:!!config.icloud?.enabled,lastError:cloudError};
+  const syncFor=(item,data=store.snapshot())=>itemSyncStatus(item,data,{enabled:!!config.icloud?.enabled,available:!!cloud,error:cloudError});
   const reloadCloud=next=>{
     if(cloudReloadPromise)throw problem('正在加载 iCloud 配置，请稍后重试',409);
     cloudReloadPromise=(async()=>{
@@ -88,7 +90,7 @@ export async function startService(config, options = {}) {
             now: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).toISO(), timeZone: config.timeZone,
             weekday: DateTime.fromMillis(options.clock?.() ?? Date.now()).setZone(config.timeZone).setLocale('zh-CN').toFormat('cccc'),
             qqConnected: transport.connected === true,syncBackend:config.icloud?.enabled?'icloud':'mac',icloud:cloudStatus(),
-            items: Object.values(d.items).map(i => ({ ...i, dueAtLocal: localTime(i.dueAt, i.timeZone) })),
+            items: Object.values(d.items).map(i => ({ ...i, dueAtLocal: localTime(i.dueAt, i.timeZone),sync:syncFor(i,d) })),
             occurrences: Object.values(d.occurrences).map(o => ({ ...o, dueAtLocal: localTime(o.dueAt, d.items[o.itemId].timeZone) })), memory: calendarMemory(d) });
         }
         if (req.method === 'GET' && url.pathname === '/v1/projections') {
@@ -128,7 +130,10 @@ export async function startService(config, options = {}) {
             if (!options.previewHook) throw problem('Preview requires the DSH plugin', 503);
             return reply(200, await options.previewHook(input));
           }
-          if (url.pathname === '/v1/upsert') return reply(200, await store.upsert(input));
+          if (url.pathname === '/v1/upsert') {
+            const saved=await store.upsert(input);
+            return reply(200,{...saved,sync:syncFor(saved)});
+          }
           if (url.pathname === '/v1/delete') return reply(200, await store.remove(input));
           if (url.pathname === '/v1/action') return reply(200, await scheduler.act(input));
         }
