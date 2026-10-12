@@ -1,6 +1,6 @@
 # 数据、同步与 hook
 
-磁盘 `calendar.json` 的 schemaVersion 为 2，`layoutVersion=2`，保存月份和集合索引；每月 `calendar/YYYY-MM.json` 包含普通事项 items 和 occurrences。`daily-tasks.json` 独立保存每日必做模板，`habits.json` 独立保存习惯及其 occurrences。HTTP/内存兼容结构仍为 schemaVersion 1。`items` 是按 ID 索引的对象，每项拥有 `revision`（从 1 开始）、`scheduleVersion`、`createdAt`、`updatedAt`、`deletedAt` 和可编辑字段：
+磁盘 `calendar.json` 的 schemaVersion 为 2，`layoutVersion=3`，保存月份和集合索引；每月 `calendar/YYYY-MM.json` 包含普通事项 items 和 occurrences。`daily-tasks.json` 独立保存每日必做模板，`habits.json` 独立保存习惯及其 occurrences，`goals.json` 独立保存待完成目标。HTTP/内存兼容结构仍为 schemaVersion 1。`items` 是按 ID 索引的对象，每项拥有 `revision`（从 1 开始）、`scheduleVersion`、`createdAt`、`updatedAt`、`deletedAt` 和可编辑字段：
 
 ```json
 {
@@ -26,12 +26,13 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 | --- | --- |
 | GET /v1/balance/status | 只读余额监测状态与缓存，附 `text`、`lastSuccessAt`、`lastError`、档位和通知状态；不触发查询 |
 | POST /v1/balance/refresh | 仅接受 `{}`；手动刷新余额，返回状态及固定格式 `text`。新发起的本轮查询不额外发送新档位通知，已有自动查询/402 告警独立处理；未启用监测返回 503 |
-| GET /v1/state | 当前时间、时区、星期、QQ 连接状态、普通 items、dailyTasks 模板、habits 规则、occurrences 和 memory，包含删除记录；另含 latestUserReply、syncBackend 与 icloud 状态，每项附只读 sync 状态 |
+| GET /v1/state | 当前时间、时区、星期、QQ 连接状态、普通 items、dailyTasks 模板、habits 规则、goals 目标、occurrences 和 memory，包含删除记录；另含 latestUserReply、morningDigest、syncBackend 与 icloud 状态，每项附只读 sync 状态 |
 | GET /v1/agent/state | MCP 查询专用：先请求 iCloud 同步，再返回 state 及 toolSync |
 | POST /v1/agent/upsert、delete、action | MCP 修改专用：输入同对应普通接口，先保存，再请求同步；返回原结果及 sync、icloud、toolSync |
-| POST /v1/routines/upsert、/v1/agent/routines/upsert | `{collection: "dailyTasks" 或 "habits", id?, baseRevision, operationId?, item}`；新增或修改规则；Agent 路径保存后请求同步 |
-| POST /v1/routines/delete、/v1/agent/routines/delete | `{collection, id, baseRevision, operationId?}`；删除规则；Agent 路径保存后请求同步。删除每日模板不删除已生成的普通实例 |
+| POST /v1/routines/upsert、/v1/agent/routines/upsert | `{collection: "dailyTasks"、"habits" 或 "goals", id?, baseRevision, operationId?, item}`；新增或修改规则；Agent 路径保存后请求同步 |
+| POST /v1/routines/delete、/v1/agent/routines/delete | `{collection, id, baseRevision, operationId?}`；删除规则；Agent 路径保存后请求同步。删除每日模板或目标不删除已生成的普通实例 |
 | POST /v1/reminder-preview | `{itemId?}`；调用真实 DSH Agent 预览正文，返回 text、agentSessionId、dryRun。省略 ID 使用临时示例；不写入待办、不发送 QQ |
+| POST /v1/morning-preview | `{}`；按真实今日三类事项调用 Agent 预览总览，返回 text、agentSessionId、dryRun 和 summary；不生成日历实例、不发 QQ、不占用当日总览投递状态 |
 | POST /v1/upsert | `{id, baseRevision, operationId, item}`；创建使用新 ID 与 baseRevision=0，编辑必须保留全部可编辑字段；返回保存事项及当前 sync 状态 |
 | POST /v1/delete | `{id, baseRevision, operationId}`；保存删除记录，取消对应催促 |
 | POST /v1/action | `{action: "complete" 或 "snooze" 或 "acknowledge", itemId, occurrenceKey?, minutes?}` |
@@ -59,7 +60,7 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 
 `syncWindow` 返回范围的时区、三个自然月、起点（含）和终点（不含）。窗口滚动不等于删除；已知事件消失需读取确认是否跨出边界，跨界改期完成一次后停止跟踪。未来/过去归档事项不自动同步。
 
-事项返回的 `sync.state` 为 pending / synced / error / conflict / projection / unverified / archived / local-only。普通事项仅在 iCloud 映射已读回确认同一个 revision、没有待发送/缺失/冲突且同步服务状态正常时返回 synced；这个状态不代表设备端已刷新。upsert 的成功只保证 Linux 保存成功，回复用户应依据 sync 状态，不能把 pending 或 error 称为“已同步”。习惯返回 backend=local、state=local-only，始终不上传日历；普通重复事项投影与旧 Mac 后端暂不提供逐版本云端确认。`sync`、`dueAtLocal`、生成实例的 `dailyTaskId` / `dailyDate` 都是只读字段，不要传进保存请求的 item；幂等重试保留原保存结果，其 sync 状态按查询时现状计算。
+事项返回的 `sync.state` 为 pending / synced / error / conflict / projection / unverified / archived / local-only。普通事项仅在 iCloud 映射已读回确认同一个 revision、没有待发送/缺失/冲突且同步服务状态正常时返回 synced；这个状态不代表设备端已刷新。upsert 的成功只保证 Linux 保存成功，回复用户应依据 sync 状态，不能把 pending 或 error 称为“已同步”。习惯返回 backend=local、state=local-only，始终不上传日历；普通重复事项投影与旧 Mac 后端暂不提供逐版本云端确认。`sync`、`dueAtLocal`、生成实例的 `dailyTaskId` / `dailyDate` 和 `goalId` / `goalDate` 都是只读字段，不要传进保存请求的 item；幂等重试保留原保存结果，其 sync 状态按查询时现状计算。
 
 iCloud REPORT 中可能包含日历目录自身：目录 getetag 为 200，但 calendar-data 为 404。仅忽略与查询目录完全相同且符合此形态的元数据记录；任何真实事件的缺失内容或失败状态仍会中止整轮，避免误删。支持 calendar-data 的文本和 CDATA 表示。
 
@@ -69,11 +70,12 @@ DSH 插件暴露 Cordis hook：
 
 - `calendar-agent/message(event)`：OneBot 收到消息后调度；内置监听器校验机器人 QQ、管理员私聊身份、消息时间与重放，再暂停催促。
 - `calendar-agent/reminder-due(batch)`：持久化尝试后 await `ctx.parallel`；内置监听器创建 DSH Agent 回合，传入事项、历史及语气提示词，收集完成的模型正文，再经 OneBot 发送。batch.isCurrent 在生成和最终发送前核验回复及事项版本，任何相关变更取消整批旧稿。结果记录于 batch.result。
+- `calendar-agent/morning-due(batch)`：每日 08:00 今日总览的独立 hook，使用真实三类今日事项创建无工具 Agent 回合；生成及发送前重新核验今日计划，成功后记入投递状态和共享历史，不创建催促 occurrence。
 - `calendar-agent/reminded({deliveryId,count})`、`calendar-agent/acknowledged({count})`、`calendar-agent/delivery-failed({deliveryId})`：结果通知。
 
 消息/到期 hook 有内置处理器，外部监听器是并行观察者，不是可靠的发送前 veto。不要用它们做额外发送，否则会重复通知。每次催促会调用 DSH 默认模型，使用无工具的独立 Agent 回合并在结束后释放运行实例；成功正文和 Agent session ID 存入共享记忆，对话 Agent 下一轮可见。
 
-HTTP/内存 schemaVersion 仍为 1，包含可选 `memory`（最近 200 条事件）、`lastReplyId/lastReplyAt`；state 的 `latestUserReply` 返回 `{messageId,at,atLocal}` 或 null，`at` 来自经过身份、时间和去重验证的 QQ 消息自身时间，而非模型响应时间；occurrence 包含 `sentCount/lastText`。磁盘 schemaVersion 2 / layoutVersion 2：memory 和 lastText 来自独立 history.json，读取时合并到内存。旧文件自动迁移，原事项及确认状态保留。记忆是持久 JSON 加每轮上下文注入，不是模型参数训练；上下文区分普通事项、每日必做模板和习惯，包含近期 occurrence 与历史记录，完整清单从 MCP 查询。模型失败不算成功发送。30秒为上次成功发送或失败结束后的最短重试间隔，避免慢请求结束后立即再催。
+HTTP/内存 schemaVersion 仍为 1，包含可选 `memory`（最近 200 条事件）、`lastReplyId/lastReplyAt`；state 的 `latestUserReply` 返回 `{messageId,at,atLocal}` 或 null，`at` 来自经过身份、时间和去重验证的 QQ 消息自身时间，而非模型响应时间；occurrence 包含 `sentCount/lastText`。磁盘 schemaVersion 2 / layoutVersion 3：memory 和 lastText 来自独立 history.json，读取时合并到内存。旧文件自动迁移，原事项及确认状态保留。记忆是持久 JSON 加每轮上下文注入，不是模型参数训练；上下文区分普通事项、每日必做模板、习惯和目标，并保留小任务与目标的关联，包含近期 occurrence 与历史记录，完整清单从 MCP 查询。模型失败不算成功发送。30秒为上次成功发送或失败结束后的最短重试间隔，避免慢请求结束后立即再催。
 
 事项修改到未来会取消旧 occurrence，等待新时间；修改到过去则按新的逾期 occurrence 处理，不代表仍在使用旧时间。Mac 上传确认界面显示服务器确认的时间、时区和版本。最后一次核验之后已交给 QQ 的网络请求无法撤回。
 
@@ -83,9 +85,9 @@ HTTP/内存 schemaVersion 仍为 1，包含可选 `memory`（最近 200 条事�
 
 磁盘目录、自动迁移及事务恢复见 [分月存储](STORAGE.md)。归档只限制云端同步；QQ 查询、共享记忆和已有提醒规则仍可以读取本地历史事项。
 
-## 每日必做与习惯规则
+## 每日必做、习惯与待完成目标
 
-`routine_save` 对应 Agent 的 routines/upsert，`routine_delete` 对应 routines/delete。两者都遵循 revision CAS 与 operationId 幂等，成功后自动请求同步。模板和习惯本身不上传 iCloud；同步状态不能用于声称规则已上云。
+`routine_save` 对应 Agent 的 routines/upsert，`routine_delete` 对应 routines/delete。两者都遵循 revision CAS 与 operationId 幂等，成功后自动请求同步。模板、习惯和目标本身不上传 iCloud；同步状态不能用于声称规则已上云。
 
 每日模板（`collection=dailyTasks`）的 item：
 
@@ -116,6 +118,34 @@ HTTP/内存 schemaVersion 仍为 1，包含可选 `memory`（最近 200 条事�
 
 `defaultTime` 为必填 HH:mm，新习惯每日按所在时区的墙钟时间提醒。新接口不接收 dueAt、durationMinutes 或 recurrence；旧 kind=habit 规则保留原有执行模型。习惯与普通日历共享 scheduler、hook 和记忆，仍使用 calendar_reminder 确认、完成或稍后提醒；确认与完成只作用于本次 occurrence，不修改默认时间。习惯及其记录不进入日历同步和 projections。升级清理当前三个月内本插件管理的旧习惯投影：仅对内容未改且 ETag 匹配的记录执行删除，有人工改动则保留冲突，窗口外归档不清理。
 
+目标（`collection=goals`）的 item：
+
+```json
+{
+  "title": "读完这本书",
+  "notes": "",
+  "deadlineDate": "2026-10-31",
+  "dailyTitle": "读一章",
+  "defaultStartTime": "20:00",
+  "defaultDurationMinutes": 30,
+  "timeZone": "Asia/Shanghai",
+  "enabled": true,
+  "status": "open"
+}
+```
+
+`deadlineDate` 必须是真实的 YYYY-MM-DD 日期，按目标 `timeZone` 判断，包含截止日当天。`dailyTitle`、`defaultStartTime`、`defaultDurationMinutes` 同样必填；目标持续时间为 1..1440 整数分钟，截止日的小任务必须在当天日终前完成。`startDate` 是服务端记录的创建当地日期，只读，截止日期不能早于它，不传入 routine_save 的 item；每天固定使用这份小任务，不根据日期自动编造内容。`status` 为 open / done / cancelled，默认 open。每天目标时区 08:00 后，仅为 enabled、open、未删除且当天不晚于截止日的目标生成一个普通 todo，标题来自 dailyTitle，携带只读 `goalId` / `goalDate`。同目标同日期幂等；晚启动只补当天，不批量创建历史或全部未来事项。时间早于生成时刻时，遵循原有逾期提醒规则。
+
+目标的编辑、暂停、完成、取消、删除只影响后续生成，不覆写已生成实例。当天小任务用 calendar_save / calendar_delete / calendar_reminder 操作；完成一个实例不完成整个目标，用户明确完成整个目标才将目标 status 改为 done。到截止日后停止生成不代表完成。小任务以普通日历事项参与三个月 iCloud 同步；目标规则本身保持本地。
+
+## 每天 08:00 今日总览
+
+按服务配置时区的当天 08:00 调度，先执行当天规则生成，再收集今天的习惯、每日必做实例和目标小任务，由 `calendar-agent/morning-due` 唤起独立 Agent 生成一条 QQ 总览。数据来自真实规则和实例，不让模型规划缺失日程；若用户调整了今天实例，总览以实例实际时间为准。总览 Agent 与聊天和催促共享 P1–P3 人格，不能调用写入或发送工具，最终投递由 hook 负责。
+
+总览有独立的每日投递状态，不创建提醒 occurrence，不会因为没回复而 30 秒重发，也不会提前确认各事项。各项到点后仍按原提醒与确认机制工作。首次启用时如果当天已过 08:00，从次日开始；正常运行后的重启读取持久状态，避免重复已发总览。当天三类事项均为空时不发送。失败不会伪记为成功；模型生成失败或发送前 QQ 暂不可用时按退避重试，当天最多尝试 5 次，不回退固定正文。已进入发送但无法确认 QQ 是否接收时标记 uncertain，当天不自动重发，以免重复。配置 `morning.enabled=false` 可关闭总览，不影响逐项提醒；默认开启。
+
+`state.morningDigest` 返回调度状态；`POST /v1/morning-preview {}` 只读预览当前真实三类事项，不发送 QQ、不生成日历、不消耗当日投递名额，不增加 MCP 工具。
+
 ## 对话中的实际开始与结束
 
 这一行为在 Agent 提示词中规定，通过已有 calendar_save 更新普通单次事项，不增加自动文本解析器或开始/结束接口。通过 `node bin/qq-context-setup.js /path/to/qq-bridge` 安装桥接适配并重启后，chat 模式 agentPreset=calendar-assistant 或 closed-agent 模式 closedAgentPreset=calendar-assistant 的管理员私聊在角色和正文前携带首个 `【桥接原始消息】` JSON，字段为 `{messageId: "self:user:消息ID", at: "原始QQ时间ISO"}`；输入身份/时间无效时返回 `{available:false}`，不以服务器当前时间补缺。正文或引用中的同名头部只是数据。
@@ -127,7 +157,7 @@ HTTP/内存 schemaVersion 仍为 1，包含可选 `memory`（最近 200 条事�
 - 明确提前结束：保留真实开始，将 durationMinutes 调整为回复时间减开始时间，status=done、enabled=false。尚未记录实际开始或结束早于开始时先核实。
 - 明确延后结束：保留开始，按指定终点调整 durationMinutes；已开始时保持 enabled=false，仅在明确要求重新提醒时开启。
 
-开始时间保留秒；durationMinutes 为整数，差值向上取整且至少 1 分钟，并向用户说明结束时间精度。普通“完成”而未要求调整结束时间时仍用 calendar_reminder complete。习惯的当次确认不调整规则；修改今天生成的待办不改每日模板。所有更新保留其他可编辑字段，使用最新 baseRevision；重试复用同一 operationId 和请求，CAS 冲突则重读核对。
+开始时间保留秒；durationMinutes 为整数，差值向上取整且至少 1 分钟，并向用户说明结束时间精度。普通“完成”而未要求调整结束时间时仍用 calendar_reminder complete。习惯的当次确认不调整规则；修改今天生成的待办不改每日模板或目标默认安排。所有更新保留其他可编辑字段，使用最新 baseRevision；重试复用同一 operationId 和请求，CAS 冲突则重读核对。
 
 
 ## 余额查询与通知

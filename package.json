@@ -1,6 +1,6 @@
 {
   "name": "dsh-calendar-agent",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "DSH QQ calendar agent with direct iCloud CalDAV sync, stdio MCP and Agent reminders",
   "type": "module",
   "license": "MIT",

@@ -1,6 +1,6 @@
 # DSH-DATE · 日历与待办助手
 
-独立的 DeepSeek Harness 插件：在 QQ 私聊中管理日历、待办和习惯；Linux 保存 JSON，由 hook 唤起 Agent 催促。支持 **Linux 直连 iCloud 日历**，Mac 无需开机；保留旧 Mac 本地同步方式作为可选后端。
+独立的 DeepSeek Harness 插件：在 QQ 私聊中管理日历、待办、习惯和待完成目标；Linux 保存 JSON，由 hook 唤起 Agent 提醒。支持 **Linux 直连 iCloud 日历**，Mac 无需开机；保留旧 Mac 本地同步方式作为可选后端。
 
 **兼容版本：** Linux、Node.js ≥ 22.13、DSH `0.2.0-rc.2`、OneBot v11（已对接 SnowLuma）。iCloud 使用 Apple 账户与 App 专用密码，经 HTTPS CalDAV 访问 Apple 服务器；无需安装 Mac 配套程序或保持 SSH 隧道。协议与故障场景已通过模拟服务测试，真实账户登录及双向同步需在填写凭据后验收。
 
@@ -9,13 +9,15 @@
 - 用 QQ 说“明天 9 点提醒我开会”“添加每日必做：9 点开始学习，持续 45 分钟”“添加习惯：每天 22 点整理房间”。时间或持续时间不明确时助手会询问。
 - **每日必做**在独立 `daily-tasks.json` 保存模板，必填默认开始时间 `defaultStartTime`（HH:mm）和默认持续分钟数 `defaultDurationMinutes`。每天模板所在时区 08:00 后生成当天普通待办，生成的待办同步日历；服务停机后只补当天。同一天同一模板只生成一次，不覆盖已改期的待办，也不重建已删除的当天待办。08:00 是生成时间；如果默认开始时间早于 08:00，生成后按逾期待办处理。
 - **习惯养成**在独立 `habits.json` 保存，必填每日默认时间 `defaultTime`（HH:mm）。只通过 hook 唤起 Agent 口头提醒，不创建日历事件；同样每 30 秒催促直到用户回复，明确完成只完成当次。
+- **待完成目标**在独立 `goals.json` 保存。必填整个目标名称、最终完成日期 `deadlineDate`（YYYY-MM-DD）、每天固定的小任务名称 `dailyTitle`、默认开始时间 `defaultStartTime`（HH:mm）和持续分钟数 `defaultDurationMinutes`。例如“目标：月底读完这本书，10 月 31 日截止，每天读一章，20 点开始，持续 30 分钟”。每天目标时区 08:00 后生成当天普通待办，直到截止日当天；小任务进入日历并按时提醒。停机只补当天，同目标同一天只生成一次。截止后停止生成，不自动认定目标完成。
+- **早上 8 点今日总览**：按服务配置时区，由独立 `calendar-agent/morning-due` hook 唤起 Agent，汇总今天的习惯、每日必做和目标小任务。总览每天一次，不因未回复而每 30 秒重发，也不提前确认各项提醒；各事项原有到点催促继续运行。首次启用时若当天已过 08:00，从第二天开始，不在升级后突然补发；当天三类清单均为空则不发送。默认开启，可在配置中设 `morning.enabled=false` 后重启关闭。
 - 到点通过 `calendar-agent/reminder-due` hook 唤起真正的 DSH Agent，根据事项、逾期时长、成功催促次数、上次正文及近期回复生成中文提醒，再给管理员 QQ 发私聊。每次最多合并 20 项，轮转避免遗漏。
 - 无回复时，上次发送后至少 30 秒开始下一次生成；模型耗时会增加实际间隔。语气逐渐直接但不责备。生成期间发生回复、改期、完成、删除或延后，会取消旧稿。
 - 管理员的**任何私聊回复**通过 `calendar-agent/message` hook 暂停所有已提醒事项的当次催促；不会自动标记完成。
 - 明确说“完成 + 事项”才标记完成。只有一个待确认事项时“完成”也可；有多个时助手应询问。习惯只完成当次，下一次照常提醒。
 - “稍后 10 分钟”恢复为延后提醒。修改计划时间会取消旧提醒。
 - 对普通单次事项明确说“开始了”：Agent 用这条 QQ 回复的真实时间更新开始时间，保留原持续时长，结束时间随之顺延，并停止开始催促。普通“收到”“好”只暂停当次提醒，不改起止时间。明确提前结束时保留实际开始、缩短持续时间并完成事项；延后结束时按指定终点调整持续时间。通过现有更新接口操作，持续时间按分钟向上取整、最少 1 分钟；无法确认事项或本条回复时间时先询问。
-- 模板和当天待办分别编辑：修改每日默认安排影响以后生成的待办，修改今天的待办不改变模板；删除模板保留已有日历实例。
+- 模板、目标和当天待办分别编辑：修改默认安排影响以后生成的待办，修改今天的待办不改变模板或目标。完成一个目标小任务不等于完成整个目标；明确完成整个目标后才停止以后生成。删除、取消、暂停或完成目标均保留已生成的日历实例；如果也要处理它们，需要明确操作。
 - JSON 保存事项、重复规则、每次提醒状态、版本和删除记录。另保留最近 200 条变更、用户回复和成功催促记录。QQ Agent 每轮自动注入当前事项和最近记忆，换会话或服务重启后也可读取；完整事项仍通过 calendar_list 查询。
 - QQ 或回复监听断开时暂停发送。催促依赖 DSH 默认模型/API；模型失败会记录错误并按间隔重试，不回退到固定文案。停机后只补当天已到时间的习惯，不追催昨天；用户明确延后到当天或未来的提醒会保留，支持跨午夜。
 - 使用专用「DSH 日历助手」日历。普通待办/事件的标题、备注、起止时间和时区双向同步；iCloud 新建事件作为待办导入。云端删除经两次完整同步及单独读取确认后生效。完成显示 `✓`，完成操作请通过 QQ。
@@ -122,7 +124,7 @@ DSH preset 已自动通过 stdio 连接本插件 MCP。其他 MCP 客户端也�
 }
 ```
 
-MCP 只在标准输出传协议消息；工具为 `calendar_list`、`calendar_save`、`calendar_delete`、`calendar_reminder`、`routine_save`、`routine_delete`。`calendar_list` 分开返回普通事项、每日必做模板和习惯；新增的 routine 工具只管理模板或习惯规则。独立运行 `node bin/calendar.js serve` 仅提供数据服务和同步接口；Agent 催促需要在 DSH 中加载本插件。DSH 内的名字加前缀 `mcp__calendar__`。
+MCP 只在标准输出传协议消息；工具为 `calendar_list`、`calendar_save`、`calendar_delete`、`calendar_reminder`、`routine_save`、`routine_delete`。`calendar_list` 分开返回普通事项、每日必做模板、习惯和待完成目标；routine 工具通过 `collection=dailyTasks | habits | goals` 管理三类规则。独立运行 `node bin/calendar.js serve` 仅提供数据服务和同步接口；Agent 催促和今日总览需要在 DSH 中加载本插件。DSH 内的名字加前缀 `mcp__calendar__`。
 
 对话与主动提醒共用 [P1–P3 人格提示词](src/persona.js)：嘴硬心软、有分寸的傲娇，带一点小俏皮；不强演口头禅，不添加动作或内心旁白，用户疲惫时收起调侃。普通聊天通常一至三句，需要解释时展开；人格只影响表达，不改变日历操作与事实确认规则。
 
@@ -143,7 +145,7 @@ ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
 
 ## 数据和同步协议
 
-见 [协议及 hook](docs/PROTOCOL.md)。`data/calendar/YYYY-MM.json` 按配置时区的开始月份保存普通事项和提醒状态；每日必做模板在 `data/daily-tasks.json`，习惯规则及习惯提醒状态在 `data/habits.json`；聊天与催促正文在 `data/history.json`，同步映射、幂等记录等运行元数据在 `data/state.json`。`data/calendar.json` 现在只是月份索引。可选余额监测单独保存 `data/balance.json`，包含查询缓存和通知状态，不混入日历或聊天记忆，也不保存 API key。`data/backup/` 保留上一次提交的分文件快照，迁移前的原文件保存在 `data/legacy/`。单进程拥有写锁，所有写入排队；持久事务日志确保跨月移动可在重启后恢复。详见 [分月存储与迁移](docs/STORAGE.md)。不要在服务运行时直接改 JSON。手动修复前停止 DSH、备份整个数据目录，再编辑或恢复。
+见 [协议及 hook](docs/PROTOCOL.md)。`data/calendar/YYYY-MM.json` 按配置时区的开始月份保存普通事项和提醒状态；每日必做模板在 `data/daily-tasks.json`，习惯规则及习惯提醒状态在 `data/habits.json`，待完成目标在 `data/goals.json`；聊天、催促和总览正文在 `data/history.json`，同步映射、幂等记录、总览投递状态等运行元数据在 `data/state.json`。`data/calendar.json` 现在只是月份索引。可选余额监测单独保存 `data/balance.json`，包含查询缓存和通知状态，不混入日历或聊天记忆，也不保存 API key。`data/backup/` 保留上一次提交的分文件快照，迁移前的原文件保存在 `data/legacy/`。单进程拥有写锁，所有写入排队；持久事务日志确保跨月移动可在重启后恢复。详见 [分月存储与迁移](docs/STORAGE.md)。不要在服务运行时直接改 JSON。手动修复前停止 DSH、备份整个数据目录，再编辑或恢复。
 
 项目为个人单用户、小规模日历设计；历史和幂等记录当前不自动清理。默认时区 Asia/Shanghai；按日历墙钟计算每日/每周重复，支持夏令时。精确执行时间受服务器调度、网络和 QQ 平台影响。消息已被 QQ 接收但写盘前崩溃时，恢复后可能重复一次，不承诺恰好一次发送。
 

@@ -55,12 +55,12 @@ test('legacy v2 monthly habits migrate without losing occurrences, sync metadata
   await store.close();delete parts['calendar.json'].layoutVersion;delete parts['calendar.json'].collections;
   parts['calendar.json'].months=['2026-10'];
   parts['calendar/2026-10.json']={schemaVersion:1,month:'2026-10',items:parts['habits.json'].items,occurrences:parts['habits.json'].occurrences};
-  delete parts['daily-tasks.json'];delete parts['habits.json'];
+  delete parts['daily-tasks.json'];delete parts['habits.json'];delete parts['goals.json'];
   await fs.mkdir(path.join(dir,'calendar'),{recursive:true});
   for(const [name,value] of Object.entries(parts))await atomicJSON(path.join(dir,name),value);
-  await fs.unlink(path.join(dir,'daily-tasks.json'));await fs.unlink(path.join(dir,'habits.json'));
+  await fs.unlink(path.join(dir,'daily-tasks.json'));await fs.unlink(path.join(dir,'habits.json'));await fs.unlink(path.join(dir,'goals.json'));
   await store.open();assert.deepEqual(store.snapshot(),expected);
-  assert.equal((await read('calendar.json')).layoutVersion,2);
+  assert.equal((await read('calendar.json')).layoutVersion,3);
   assert.equal((await read('habits.json')).items[saved.id].revision,1);
   assert.deepEqual((await read('calendar/2026-10.json')).items,{});
   assert.equal((await read('backup/calendar.json')).layoutVersion,undefined);

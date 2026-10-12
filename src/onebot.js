@@ -16,12 +16,17 @@ export class OneBot {
     }
     return { httpToken: (await fs.readFile(c.httpTokenFile, 'utf8')).trim(), wsToken: (await fs.readFile(c.wsTokenFile ?? c.httpTokenFile, 'utf8')).trim() };
   }
-  async call(action, body = {}) {
+  async call(action, body = {}, {beforeRequest} = {}) {
     const { httpToken } = await this.credentials();
-    const r = await fetch(`${this.config.httpUrl.replace(/\/$/, '')}/${action}`, {
+    const url=`${this.config.httpUrl.replace(/\/$/, '')}/${action}`;
+    const request={
       method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${httpToken}` },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(10000), redirect: 'error'
-    });
+      body: JSON.stringify(body), redirect: 'error'
+    };
+    // Only claim a delivery once credentials and request preparation succeeded.
+    if(beforeRequest && !await beforeRequest())return {skipped:true};
+    request.signal=AbortSignal.timeout(10000);
+    const r = await fetch(url,request);
     if (!r.ok) throw new Error(`OneBot HTTP ${r.status}`);
     const value = await r.json();
     if (value.status !== 'ok' || value.retcode !== 0) throw new Error(`OneBot retcode ${value.retcode}`);
@@ -33,7 +38,14 @@ export class OneBot {
     const self = await this.call('get_login_info');
     if (String(self.user_id) !== String(this.config.botQQ)) throw new Error('Unexpected bot QQ; refusing to send');
     if (batch.isCurrent && !await batch.isCurrent()) return { skipped: true };
-    return this.call('send_private_msg', { user_id: Number(this.config.ownerQQ), message: [{ type: 'text', data: { text: batch.text } }] });
+    return this.call('send_private_msg', { user_id: Number(this.config.ownerQQ), message: [{ type: 'text', data: { text: batch.text } }] },{
+      beforeRequest:async()=>{
+        if(this.closed || !this.connected)throw Error('QQ reply hook disconnected');
+        if(batch.isCurrent && !await batch.isCurrent())return false;
+        if(batch.markSending && !await batch.markSending())return false;
+        return !this.closed && this.connected && (!batch.isCurrent || await batch.isCurrent());
+      }
+    });
   }
   async start() {
     if (this.closed) return;

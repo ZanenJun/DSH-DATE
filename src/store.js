@@ -6,20 +6,20 @@ import { DateTime } from 'luxon';
 import { normalizeItem, editable, problem } from './model.js';
 import { remember } from './memory.js';
 import {partition,readStorageSync,validateJournal} from './storage-layout.js';
-import {dailyTaskInput,habitInput,habitItem,habitTime,timeOnDate} from './routines.js';
+import {dailyTaskInput,habitInput,goalInput,calendarDate,habitItem,habitTime,timeOnDate} from './routines.js';
 
 function validId(value,max=100) {
   return typeof value==='string' && !Object.hasOwn(Object.prototype,value) && value!=='prototype'
     && new RegExp(`^[\\w-]{1,${max}}$`).test(value);
 }
 function validateRoutineRequest(collection,id,baseRevision,operationId,remove=false) {
-  if(!['dailyTasks','habits'].includes(collection) || !validId(id,collection==='dailyTasks'?72:100)
+  if(!['dailyTasks','habits','goals'].includes(collection) || !validId(id,collection==='habits'?100:72)
     || !validId(operationId,128) || !Number.isInteger(baseRevision) || baseRevision<(remove?1:0))throw problem('Invalid routine request');
 }
 function writeItem(data,id,normalized,now,defaultTime) {
   const old=data.items[id],at=new Date(now).toISOString();
   const next={...normalized,id,revision:(old?.revision??0)+1,createdAt:old?.createdAt??at,updatedAt:at,deletedAt:null};
-  for(const field of ['dailyTaskId','dailyDate'])if(old?.[field]!==undefined)next[field]=old[field];
+  for(const field of ['dailyTaskId','dailyDate','goalId','goalDate'])if(old?.[field]!==undefined)next[field]=old[field];
   if(next.kind==='habit')next.defaultTime=defaultTime ?? (old?.kind==='habit' && old.dueAt===next.dueAt && old.timeZone===next.timeZone
     ? habitTime(old) : habitTime(next));
   const scheduleChanged=old && (['dueAt','timeZone','recurrence'].some(key=>JSON.stringify(old[key])!==JSON.stringify(next[key]))
@@ -96,16 +96,23 @@ export class CalendarStore {
       catch (e) {
         const indexExists=await fs.access(this.file).then(()=>true,err=>{if(err.code==='ENOENT')return false;throw err;});
         if (e.code !== 'ENOENT' || indexExists) throw new Error('calendar.json is unreadable; refusing to overwrite it', { cause: e });
-        const layoutFiles=await Promise.all(['state.json','history.json','daily-tasks.json','habits.json'].map(name=>fs.access(path.join(this.directory,name)).then(()=>true,err=>{if(err.code==='ENOENT')return false;throw err;})));
+        const layoutFiles=await Promise.all(['state.json','history.json','daily-tasks.json','habits.json','goals.json'].map(name=>fs.access(path.join(this.directory,name)).then(()=>true,err=>{if(err.code==='ENOENT')return false;throw err;})));
         const months=await fs.readdir(path.join(this.directory,'calendar')).catch(err=>{if(err.code==='ENOENT')return [];throw err;});
         if(layoutFiles.some(Boolean)||months.length)throw Error('calendar.json index is missing; refusing to overwrite existing partitions');
-        this.data = { schemaVersion: 1, revision: 0, items: {}, occurrences: {}, dailyTasks:{}, receipts: {}, seenMessages: [], lastDeliveryAt: null, syncClients: {} };
+        this.data = { schemaVersion: 1, revision: 0, items: {}, occurrences: {}, dailyTasks:{}, goals:{}, receipts: {}, seenMessages: [], lastDeliveryAt: null, syncClients: {} };
         this.parts=null;
       }
       if (this.data.schemaVersion !== 1 || !this.data.items || !this.data.occurrences || !Number.isInteger(this.data.revision)) throw new Error('Unsupported calendar data schema');
       for (const item of Object.values(this.data.items)) normalizeItem(editable(item));
       this.data.dailyTasks??={};
       for(const item of Object.values(this.data.dailyTasks))dailyTaskInput.parse(Object.fromEntries(['title','notes','timeZone','enabled','defaultStartTime','defaultDurationMinutes'].map(key=>[key,item[key]])));
+      this.data.goals??={};
+      for(const [id,item] of Object.entries(this.data.goals)) {
+        goalInput.parse(Object.fromEntries(['title','notes','timeZone','enabled','status','deadlineDate','dailyTitle','defaultStartTime','defaultDurationMinutes'].map(key=>[key,item[key]])));
+        calendarDate.parse(item.startDate);
+        if(!validId(id,72) || item.id!==id || item.deadlineDate<item.startDate
+          || Object.hasOwn(this.data.items,id) || Object.hasOwn(this.data.dailyTasks,id))throw Error('Invalid stored goal');
+      }
       if(!this.parts) {
         // Preserve the original mixed v1 file once, outside the active layout.
         await fs.mkdir(path.join(this.directory,'legacy'),{recursive:true,mode:0o700});
@@ -115,9 +122,12 @@ export class CalendarStore {
         this.parts=partition(this.data,this.timeZone);
         await publishParts(this.directory,this.parts);
         await fs.unlink(this.file+'.backup').catch(e=>{if(e.code!=='ENOENT')throw e;});
-      } else if(this.parts['calendar.json'].layoutVersion!==2) {
-        // The old monthly layout may contain habits. Preserve it as a complete
-        // backup, then atomically publish separate routine collections.
+      } else if(this.parts['calendar.json'].layoutVersion!==3) {
+        // Retain an immutable pre-migration snapshot as well as the rolling
+        // backup; later routine edits must not erase the original layout.
+        const legacy=path.join(this.directory,'legacy',`layout-${this.parts['calendar.json'].layoutVersion??'monthly'}`);
+        const preserved=await fs.access(path.join(legacy,'calendar.json')).then(()=>true,e=>{if(e.code==='ENOENT')return false;throw e;});
+        if(!preserved)await publishParts(legacy,this.parts);
         await publishParts(path.join(this.directory,'backup'),this.parts);
         this.backupParts=this.parts;
         const parts=partition(this.data,this.timeZone,this.parts['calendar.json'].months);
@@ -166,7 +176,7 @@ export class CalendarStore {
         return d.receipts[operationId].result;
       }
       const old = d.items[id];
-      if(Object.hasOwn(d.dailyTasks??{},id))throw problem('ID already belongs to a daily task template',409);
+      if(Object.hasOwn(d.dailyTasks??{},id) || Object.hasOwn(d.goals??{},id))throw problem('ID already belongs to a routine template',409);
       if ((old?.revision ?? 0) !== baseRevision) throw problem('Revision conflict: reload item before editing', 409);
       if (old?.deletedAt) throw problem('Deleted items cannot be resurrected; create a new item', 409);
       const next = writeItem(d,id,normalized,this.clock());
@@ -197,16 +207,18 @@ export class CalendarStore {
   async saveRoutine({collection,id,baseRevision=0,operationId=randomUUID(),item}) {
     id??=`routine_${createHash('sha256').update(String(operationId)).digest('hex').slice(0,32)}`;
     validateRoutineRequest(collection,id,baseRevision,operationId);
-    const parsed=(collection==='dailyTasks'?dailyTaskInput:habitInput).parse(item);
+    const parsed=({dailyTasks:dailyTaskInput,habits:habitInput,goals:goalInput}[collection]).parse(item);
     return this.transact(d=>{
       const fingerprint=JSON.stringify({collection,id,baseRevision,item:parsed});
       if(d.receipts[operationId]) {
         if(d.receipts[operationId].fingerprint!==fingerprint)throw problem('operationId was reused for a different change',409);
         return d.receipts[operationId].result;
       }
-      const templates=d.dailyTasks??={},old=collection==='dailyTasks'?templates[id]:d.items[id];
-      if((collection==='dailyTasks' && Object.hasOwn(d.items,id))
-        || (collection==='habits' && (Object.hasOwn(templates,id) || (old && old.kind!=='habit'))))throw problem('ID belongs to a different collection',409);
+      const dailyTasks=d.dailyTasks??={},goals=d.goals??={};
+      const templates=collection==='goals'?goals:dailyTasks,old=collection==='habits'?d.items[id]:templates[id];
+      if((collection==='dailyTasks' && (Object.hasOwn(d.items,id) || Object.hasOwn(goals,id)))
+        || (collection==='goals' && (Object.hasOwn(d.items,id) || Object.hasOwn(dailyTasks,id)))
+        || (collection==='habits' && (Object.hasOwn(dailyTasks,id) || Object.hasOwn(goals,id) || (old && old.kind!=='habit'))))throw problem('ID belongs to a different collection',409);
       if((old?.revision??0)!==baseRevision)throw problem('Revision conflict: reload routine before editing',409);
       if(old?.deletedAt)throw problem('Deleted routines cannot be resurrected; create a new routine',409);
       const now=this.clock(),at=new Date(now).toISOString();
@@ -214,9 +226,14 @@ export class CalendarStore {
       if(collection==='habits')next=writeItem(d,id,habitItem(parsed,now,old),now,parsed.defaultTime);
       else {
         next={...parsed,id,revision:(old?.revision??0)+1,createdAt:old?.createdAt??at,updatedAt:at,deletedAt:null};
+        if(collection==='goals') {
+          next.startDate=old?.startDate??DateTime.fromMillis(now,{zone:next.timeZone}).toISODate();
+          if(next.deadlineDate<next.startDate)throw problem('Goal deadline must be on or after its start date');
+        }
         templates[id]=next;
-        remember(d,{type:old?'daily-task-updated':'daily-task-created',itemId:id,title:next.title,
-          defaultStartTime:next.defaultStartTime,defaultDurationMinutes:next.defaultDurationMinutes,timeZone:next.timeZone,revision:next.revision},now);
+        remember(d,{type:collection==='goals'?(old?'goal-updated':'goal-created'):(old?'daily-task-updated':'daily-task-created'),itemId:id,title:next.title,
+          defaultStartTime:next.defaultStartTime,defaultDurationMinutes:next.defaultDurationMinutes,timeZone:next.timeZone,revision:next.revision,
+          ...(collection==='goals'?{deadlineDate:next.deadlineDate,dailyTitle:next.dailyTitle,status:next.status}:{})},now);
       }
       d.receipts[operationId]={fingerprint,result:structuredClone(next)};
       return next;
@@ -230,7 +247,7 @@ export class CalendarStore {
         if(d.receipts[operationId].fingerprint!==fingerprint)throw problem('operationId reused',409);
         return d.receipts[operationId].result;
       }
-      const item=collection==='dailyTasks'?d.dailyTasks?.[id]:d.items[id];
+      const item=collection==='dailyTasks'?d.dailyTasks?.[id]:collection==='goals'?d.goals?.[id]:d.items[id];
       if(!item || (collection==='habits' && item.kind!=='habit'))throw problem('Routine not found',404);
       if(item.revision!==baseRevision)throw problem('Revision conflict: reload before deleting routine',409);
       if(item.deletedAt)throw problem('Routine is already deleted',409);
@@ -238,7 +255,7 @@ export class CalendarStore {
       for(const occurrence of Object.values(d.occurrences)) {
         if(occurrence.itemId===id && ['active','acknowledged'].includes(occurrence.state))occurrence.state='cancelled';
       }
-      remember(d,{type:collection==='dailyTasks'?'daily-task-deleted':'item-deleted',itemId:id,title:item.title},now);
+      remember(d,{type:collection==='dailyTasks'?'daily-task-deleted':collection==='goals'?'goal-deleted':'item-deleted',itemId:id,title:item.title},now);
       d.receipts[operationId]={fingerprint,result:structuredClone(item)};
       return item;
     });
@@ -246,24 +263,28 @@ export class CalendarStore {
   async generateDailies() {
     return this.transact(d=>{
       const created=[],now=this.clock();
-      for(const template of Object.values(d.dailyTasks??{})) {
-        if(template.deletedAt || !template.enabled)continue;
+      const templates=[...Object.values(d.dailyTasks??{}).map(template=>({template,goal:false})),...Object.values(d.goals??{}).map(template=>({template,goal:true}))];
+      for(const {template,goal} of templates) {
+        if(template.deletedAt || !template.enabled || (goal && template.status!=='open'))continue;
         const local=DateTime.fromMillis(now,{zone:template.timeZone});
         if(local.hour<8)continue;
-        const date=local.toISODate(),marker=`${template.id}:${date}`,id=`daily_${template.id}_${date.replaceAll('-','')}`;
-        if(d.dailyGenerations?.[marker])continue;
+        const date=local.toISODate();
+        if(goal && (date<template.startDate || date>template.deadlineDate))continue;
+        const marker=`${template.id}:${date}`,id=`${goal?'goal':'daily'}_${template.id}_${date.replaceAll('-','')}`;
+        const generations=goal?'goalGenerations':'dailyGenerations',sourceId=goal?'goalId':'dailyTaskId',sourceDate=goal?'goalDate':'dailyDate';
+        if(d[generations]?.[marker])continue;
         const existing=d.items[id];
         if(existing) {
-          if(existing.dailyTaskId!==template.id || existing.dailyDate!==date)throw problem('Generated daily task ID belongs to another item',409);
+          if(existing[sourceId]!==template.id || existing[sourceDate]!==date)throw problem('Generated routine task ID belongs to another item',409);
           continue;
         }
-        if(Object.hasOwn(d.dailyTasks,id))throw problem('Generated daily task ID belongs to a template',409);
-        const normalized=normalizeItem({title:template.title,notes:template.notes,kind:'todo',
+        if(Object.hasOwn(d.dailyTasks??{},id) || Object.hasOwn(d.goals??{},id))throw problem('Generated routine task ID belongs to a template',409);
+        const normalized=normalizeItem({title:goal?template.dailyTitle:template.title,notes:template.notes,kind:'todo',
           dueAt:timeOnDate(date,template.defaultStartTime,template.timeZone),durationMinutes:template.defaultDurationMinutes,
           timeZone:template.timeZone,enabled:true,status:'open',recurrence:null});
         const saved=writeItem(d,id,normalized,now);
-        saved.dailyTaskId=template.id;saved.dailyDate=date;
-        d.dailyGenerations??={};d.dailyGenerations[marker]=id;
+        saved[sourceId]=template.id;saved[sourceDate]=date;
+        d[generations]??={};d[generations][marker]=id;
         created.push(saved);
       }
       return created;

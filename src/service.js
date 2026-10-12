@@ -14,6 +14,7 @@ import { readConfig } from './config.js';
 import { itemSyncStatus } from './sync-status.js';
 import {syncWindow} from './sync-window.js';
 import {formatBalance} from './balance-format.js';
+import {MorningDigestScheduler} from './morning-digest.js';
 
 export async function tokenFor(directory) {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -37,13 +38,18 @@ async function body(req) {
 export async function startService(config, options = {}) {
   const store = await new CalendarStore(config.dataDir, { clock: options.clock,timeZone:config.timeZone }).open();
   const diagnostics = { startedAt: new Date().toISOString(), requests: {} };
-  let server, timer, routineTimer, routineWork, transport, scheduler, cloud, cloudTimer, cloudError=null, cloudReloadPromise=null;
+  let server, timer, routineTimer, routineWork, transport, scheduler, morning, cloud, cloudTimer, cloudError=null, cloudReloadPromise=null, closing=false;
   const cloudStatus=()=>cloud?.status()??{enabled:!!config.icloud?.enabled,lastError:cloudError};
   const syncFor=(item,data=store.snapshot())=>itemSyncStatus(item,data,{enabled:!!config.icloud?.enabled,available:!!cloud,error:cloudError,now:options.clock?.()??Date.now(),timeZone:config.timeZone});
   const generateDailies=async({sync=true}={})=>{
     const created=await store.generateDailies();
-    if(created.length && sync)cloud?.requestSync().catch(()=>options.log?.('每日必做已保存，等待 iCloud 重试'));
+    if(created.length && sync)cloud?.requestSync().catch(()=>options.log?.('每日事项已保存，等待 iCloud 重试'));
     return created;
+  };
+  const tickRoutines=async()=>{
+    if(closing)return;
+    await generateDailies();
+    if(!closing)await morning?.tick();
   };
   const syncForTool=async()=>{
     if(!cloud)return {state:config.icloud?.enabled?'unavailable':'disabled'};
@@ -79,8 +85,11 @@ export async function startService(config, options = {}) {
       clock: options.clock, repeatMs: config.repeatMs, ...config.onebot,
       send: options.sendHook ?? (async () => { throw Error('Reminder delivery requires the DSH Agent plugin'); }), onEvent: options.onEvent
     });
+    if(config.morning?.enabled!==false && options.morningSendHook)morning=new MorningDigestScheduler(store,{
+      clock:options.clock,timeZone:config.timeZone,send:options.morningSendHook,onEvent:options.onEvent
+    });
     server = http.createServer(async (req, res) => {
-      const route = ['/v1/balance/status','/v1/balance/refresh','/v1/agent/routines/upsert', '/v1/agent/routines/delete', '/v1/routines/upsert', '/v1/routines/delete', '/v1/agent/state', '/v1/agent/upsert', '/v1/agent/delete', '/v1/agent/action', '/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
+      const route = ['/v1/balance/status','/v1/balance/refresh','/v1/agent/routines/upsert', '/v1/agent/routines/delete', '/v1/routines/upsert', '/v1/routines/delete', '/v1/agent/state', '/v1/agent/upsert', '/v1/agent/delete', '/v1/agent/action', '/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview','/v1/morning-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
       const client = /DSHCalendarSync|CFNetwork|Darwin/i.test(req.headers['user-agent'] ?? '') ? 'mac' : 'other';
       const method = ['GET', 'POST'].includes(req.method) ? req.method : 'other';
       res.on('finish', () => {
@@ -119,6 +128,7 @@ export async function startService(config, options = {}) {
             qqConnected: transport.connected === true,syncBackend:config.icloud?.enabled?'icloud':'mac',icloud:cloudStatus(),syncWindow:syncWindow(options.clock?.()??Date.now(),config.timeZone),
             latestUserReply:d.lastReplyAt==null?null:{messageId:d.lastReplyId,at:new Date(d.lastReplyAt).toISOString(),atLocal:localTime(new Date(d.lastReplyAt).toISOString(),config.timeZone)},
             dailyTasks:Object.values(d.dailyTasks??{}),
+            goals:Object.values(d.goals??{}),morningDigest:morning?.status()??{enabled:false,timeZone:config.timeZone},
             habits:Object.values(d.items).filter(i=>i.kind==='habit').map(i=>({...i,defaultTime:i.defaultTime??DateTime.fromISO(i.dueAt).setZone(i.timeZone).toFormat('HH:mm'),dueAtLocal:localTime(i.dueAt,i.timeZone),sync:syncFor(i,d)})),
             items: Object.values(d.items).filter(i=>i.kind!=='habit').map(i => ({ ...i, dueAtLocal: localTime(i.dueAt, i.timeZone),sync:syncFor(i,d) })),
             occurrences: Object.values(d.occurrences).map(o => ({ ...o, dueAtLocal: localTime(o.dueAt, d.items[o.itemId].timeZone) })), memory: calendarMemory(d) });
@@ -168,12 +178,19 @@ export async function startService(config, options = {}) {
             if (!options.previewHook) throw problem('Preview requires the DSH plugin', 503);
             return reply(200, await options.previewHook(input));
           }
+          if(url.pathname==='/v1/morning-preview') {
+            if(Object.keys(input).length)throw problem('Morning preview takes no parameters');
+            if(!options.previewMorningHook)throw problem('Morning preview requires the DSH plugin',503);
+            return reply(200,await options.previewMorningHook());
+          }
           if(url.pathname==='/v1/routines/upsert' || url.pathname==='/v1/routines/delete') {
             const saved=url.pathname.endsWith('/upsert')?await store.saveRoutine(input):await store.removeRoutine(input);
             const created=await generateDailies({sync:!agentRoute});
             const toolSync=agentRoute?await syncForTool():undefined;
             return reply(200,{...saved,collection:input.collection,
-              sync:input.collection==='habits'?syncFor(saved):{backend:'local',state:'template',message:saved.deletedAt?'每日必做模板已删除；已生成的日历事项保留。':'每日必做模板已保存；每天 08:00 生成普通日历待办，模板本身不上传。'},
+              sync:input.collection==='habits'?syncFor(saved):{backend:'local',state:'template',message:input.collection==='goals'
+                ?saved.deletedAt?'目标已删除；已生成的日历小任务保留。':'目标已保存；启用且未完成时，每天 08:00 生成小任务至截止日期（含当天），目标清单本身不上传。'
+                :saved.deletedAt?'每日必做模板已删除；已生成的日历事项保留。':'每日必做模板已保存；每天 08:00 生成普通日历待办，模板本身不上传。'},
               generated:created.map(i=>({...i,sync:syncFor(i)})),toolSync,icloud:cloudStatus()});
           }
           if (url.pathname === '/v1/upsert') {
@@ -198,7 +215,7 @@ export async function startService(config, options = {}) {
     if(options.startTimer!==false){
       routineTimer=setInterval(()=>{
         if(routineWork)return;
-        routineWork=generateDailies().catch(()=>options.log?.('每日必做生成失败，将重试')).finally(()=>{routineWork=null;});
+        routineWork=tickRoutines().catch(()=>options.log?.('每日事项生成或早晨汇总失败，将重试')).finally(()=>{routineWork=null;});
       },1000);routineTimer.unref();
     }
     if(options.startCloudTimer!==false){cloudTimer=setInterval(()=>cloud?.tick().catch(()=>options.log?.('iCloud 同步状态保存失败')),1000);cloudTimer.unref();}
@@ -206,16 +223,18 @@ export async function startService(config, options = {}) {
       timer = setInterval(() => scheduler.tick().catch(() => options.log?.('Calendar tick failed')), 1000);
       timer.unref();
     }
-    return { store, scheduler, transport, generateDailies, port: server.address().port,
+    return { store, scheduler, morning, transport, generateDailies, tickRoutines, port: server.address().port,
       async close() {
+        closing=true;const morningClosing=morning?.close();
         scheduler.stopped = true; clearInterval(timer);clearInterval(routineTimer);clearInterval(cloudTimer); transport.close();
         await new Promise(resolve => server.close(resolve));
         await routineWork;
+        await morningClosing;
         await cloudReloadPromise?.catch(()=>{});
         await cloud?.close();
         while (scheduler.busy) await new Promise(resolve => setTimeout(resolve, 10));
         await store.close();
       }
     };
-  } catch (e) { clearInterval(timer);clearInterval(routineTimer);clearInterval(cloudTimer);await routineWork;await cloud?.close(); transport?.close(); server?.close(); await store.close(); throw e; }
+  } catch (e) { closing=true;clearInterval(timer);clearInterval(routineTimer);clearInterval(cloudTimer);await morning?.close();await routineWork;await cloud?.close(); transport?.close(); server?.close(); await store.close(); throw e; }
 }

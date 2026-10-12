@@ -3,6 +3,7 @@
   "port": 3217,
   "timeZone": "Asia/Shanghai",
   "repeatMs": 30000,
+  "morning": { "enabled": true, "timeoutMs": 60000 },
   "balance": {
     "enabled": false,
     "intervalMs": 3600000,

@@ -22,6 +22,10 @@ const configSchema = z.object({
     tone: z.string().min(1).max(1000).default(defaultReminderTone),
     timeoutMs: z.number().int().min(1000).max(120000).default(45000)
   }).default({ tone: defaultReminderTone, timeoutMs: 45000 }),
+  morning:z.object({
+    enabled:z.boolean().default(true),
+    timeoutMs:z.number().int().min(1000).max(120000).default(60000)
+  }).strict().default({enabled:true,timeoutMs:60000}),
   balance:z.object({
     enabled:z.boolean().default(false),providerId:z.string().min(1).max(200).optional(),
     intervalMs:z.number().int().min(60000).max(86400000).default(3600000),
