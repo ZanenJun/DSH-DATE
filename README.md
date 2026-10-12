@@ -21,6 +21,7 @@
 - 使用专用「DSH 日历助手」日历。普通待办/事件的标题、备注、起止时间和时区双向同步；iCloud 新建事件作为待办导入。云端删除经两次完整同步及单独读取确认后生效。完成显示 `✓`，完成操作请通过 QQ。
 - 习惯规则由 QQ 管理，**不写入日历**；旧版本由本插件创建的习惯投影，仅清理当前同步窗口内且未被人工修改的记录；改动过的记录保留为冲突，窗口外归档保留。普通重复事项仍可投影到日历。全天事件、原生日历重复事件和会议邀请不支持导入。
 - 两端同时修改同一事项时保留冲突，不自动覆盖。iCloud 模式用 `icloud-resolve` 选择保留版本；旧 Mac 模式仍在配套应用中处理冲突。
+- 可选的 DeepSeek API 余额监测独立运行：默认 5 元/1 元两档提醒，持续偏低时 24 小时冷却；余额不足告警使用固定 QQ 正文，不依赖模型生成。管理员可用纯文字“查余额”绕过 Agent 查询。
 
 ## iCloud 直连（推荐）
 
@@ -39,6 +40,18 @@ node bin/calendar.js icloud-status
 每次调用日历 MCP 工具会主动请求同步：查询前拉取，保存、删除及提醒操作后同步。工具最多等待 8 秒，慢请求继续在后台运行；返回实际同步状态，网络失败不会撤销已保存的事项。已有旧配置请把 `icloud.intervalMs` 改为 `20000` 并重启 DSH；未指定时默认 20 秒。QQ 催促间隔仍为 30 秒。
 
 启用后旧 Mac 同步程序会被拒绝访问，请退出它。无需删除日历、JSON 或 Mac 映射。符合旧 `dshcalendar://item/ID` 标记且两端内容一致的事件会接管原 ID；内容不一致则保留冲突，避免重复导入或静默覆盖。完整配置、冲突处理与迁移说明见 [iCloud 设置](docs/ICLOUD_SETUP.md)。
+
+## DeepSeek API 余额（可选）
+
+配置中设 `"balance": { "enabled": true }`，重启 DSH。省略 `providerId` 时跟随 DSH 默认模型的 provider，沿用 DSH 凭据；仅支持官方 DeepSeek 地址，第三方中转不查询。启动、后台每小时、模型活跃时至少间隔 10 分钟、对应模型返回 402，以及手动查询会触发检查；与日历同步和催促定时器独立。
+
+要在 QQ 里直接查询，还必须安装桥接适配并重启 qq-bridge：
+
+```bash
+node bin/qq-balance-setup.js /absolute/path/to/qq-bridge
+```
+
+随后管理员私聊发送纯文字 `查余额`、`查询余额` 或 `/balance`，无需 Agent 处理。DSH 与桥接需指向同一 `DSH_HOME` / `DSH_CALENDAR_CONFIG`。查询失败会明确提示，并在可用时展示带时间的上次成功缓存；不会当作 0 元。默认关闭、CNY 阈值、USD 单独配置、通知冷却和 CLI 用法见 [余额设置与查询](docs/BALANCE.md)。
 
 ## 旧 Mac 后端：通过 Git 安装和更新（可选）
 
@@ -84,7 +97,7 @@ node bin/qq-context-setup.js /absolute/path/to/qq-bridge
 
 命令只修改已识别版本的私聊消息入口，备份完整原文件并保留其他本地修改；重复执行不重复插入，未知版本会拒绝修改。完成后重启 qq-bridge。该适配对上述两种模式下的 `calendar-assistant` 管理员私聊生效，在用户正文前携带原始消息 ID 和发送时间；手机语音转写等待不改变时间。桥接更新后可重新运行检查。没有这份元数据时，Agent 只能在历史中唯一匹配当前消息，否则会询问实际时间，不使用模型处理时间代替。
 
-配置默认位于 `$DSH_HOME/calendar-agent/config.json`（DSH_HOME 未指定时 `~/.dsh`）。支持 `DSH_CALENDAR_CONFIG` 指定其他路径；需要同时传入 **DSH 服务环境**，不能只在安装终端设置。可编辑时区、端口及 OneBot 的 HTTP/WS 地址；仅允许回环地址，远程服务用 SSH 转发。其他 OneBot 实现可以用独立 `httpTokenFile` / `wsTokenFile`。
+配置默认位于 `$DSH_HOME/calendar-agent/config.json`（DSH_HOME 未指定时 `~/.dsh`）。支持 `DSH_CALENDAR_CONFIG` 指定其他路径；需要传入 **DSH 服务环境**；使用 QQ 直查余额时还须传入 **qq-bridge 服务环境**，不能只在安装终端设置。可编辑时区、端口及 OneBot 的 HTTP/WS 地址；仅允许回环地址，远程服务用 SSH 转发。其他 OneBot 实现可以用独立 `httpTokenFile` / `wsTokenFile`。
 
 ```bash
 node bin/calendar.js status
@@ -128,7 +141,7 @@ ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
 
 ## 数据和同步协议
 
-见 [协议及 hook](docs/PROTOCOL.md)。`data/calendar/YYYY-MM.json` 按配置时区的开始月份保存普通事项和提醒状态；每日必做模板在 `data/daily-tasks.json`，习惯规则及习惯提醒状态在 `data/habits.json`；聊天与催促正文在 `data/history.json`，同步映射、幂等记录等运行元数据在 `data/state.json`。`data/calendar.json` 现在只是月份索引。`data/backup/` 保留上一次提交的分文件快照，迁移前的原文件保存在 `data/legacy/`。单进程拥有写锁，所有写入排队；持久事务日志确保跨月移动可在重启后恢复。详见 [分月存储与迁移](docs/STORAGE.md)。不要在服务运行时直接改 JSON。手动修复前停止 DSH、备份整个数据目录，再编辑或恢复。
+见 [协议及 hook](docs/PROTOCOL.md)。`data/calendar/YYYY-MM.json` 按配置时区的开始月份保存普通事项和提醒状态；每日必做模板在 `data/daily-tasks.json`，习惯规则及习惯提醒状态在 `data/habits.json`；聊天与催促正文在 `data/history.json`，同步映射、幂等记录等运行元数据在 `data/state.json`。`data/calendar.json` 现在只是月份索引。可选余额监测单独保存 `data/balance.json`，包含查询缓存和通知状态，不混入日历或聊天记忆，也不保存 API key。`data/backup/` 保留上一次提交的分文件快照，迁移前的原文件保存在 `data/legacy/`。单进程拥有写锁，所有写入排队；持久事务日志确保跨月移动可在重启后恢复。详见 [分月存储与迁移](docs/STORAGE.md)。不要在服务运行时直接改 JSON。手动修复前停止 DSH、备份整个数据目录，再编辑或恢复。
 
 项目为个人单用户、小规模日历设计；历史和幂等记录当前不自动清理。默认时区 Asia/Shanghai；按日历墙钟计算每日/每周重复，支持夏令时。精确执行时间受服务器调度、网络和 QQ 平台影响。消息已被 QQ 接收但写盘前崩溃时，恢复后可能重复一次，不承诺恰好一次发送。
 

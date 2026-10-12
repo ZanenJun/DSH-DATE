@@ -16,6 +16,10 @@ const command = positionals[0]; const configFile = path.resolve(values.config ||
 try {
   if(command==='icloud-setup') {
     await (await import('./icloud-setup.js')).setupICloud(configFile);
+  } else if(['balance-status','balance-refresh'].includes(command)) {
+    const api=await localClient(configFile);
+    const result=command==='balance-status'?await api('balance/status'):await api('balance/refresh',{});
+    console.log(JSON.stringify(result,null,2));
   } else if(['icloud-status','icloud-sync','icloud-resolve'].includes(command)) {
     const api=await localClient(configFile);
     const result=command==='icloud-status'?await api('icloud/status'):command==='icloud-sync'?await api('icloud/sync',{}):await api('icloud/resolve',{id:positionals[1],prefer:values.prefer});
@@ -60,5 +64,5 @@ try {
     const service = await startService(await readConfig(configFile), {log: m=>console.error(m)});
     console.error(`Calendar service listening on 127.0.0.1:${service.port}`);
     for(const signal of ['SIGINT','SIGTERM']) process.once(signal,async()=>{await service.close();process.exit(0);});
-  } else console.log('dsh-calendar init | install | status | icloud-setup | icloud-status | icloud-sync | icloud-resolve ID --prefer local|remote | pair [--show-token] | serve\nUse --config PATH to select a configuration.');
+  } else console.log('dsh-calendar init | install | status | balance-status | balance-refresh | icloud-setup | icloud-status | icloud-sync | icloud-resolve ID --prefer local|remote | pair [--show-token] | serve\nUse --config PATH to select a configuration.');
 } catch(e) { console.error(e.message); process.exitCode=1; }

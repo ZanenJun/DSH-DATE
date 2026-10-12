@@ -4,13 +4,15 @@ import { startService } from './service.js';
 import { ReminderAgent } from './reminder-agent.js';
 import { randomUUID } from 'node:crypto';
 import { problem } from './model.js';
+import {createBalanceRuntime,sendBalanceNotification} from './balance-runtime.js';
 export const name = 'calendar-agent';
-export const inject = ['agents', 'agentDefaultModel', 'tools', 'systemPrompt'];
+export const inject = ['agents', 'agentDefaultModel', 'tools', 'systemPrompt', 'llm', 'settings'];
 export const Config = Schema.object({ configFile: Schema.string().default('') });
 export async function apply(ctx, options) {
   const config = await readConfig(options.configFile || undefined);
   const generator = new ReminderAgent(ctx, config.reminder);
   let service, previewing = false;
+  const balance=await createBalanceRuntime(ctx,config.balance,config.dataDir,{send:(text,options)=>sendBalanceNotification(service?.transport,text,options)});
   // Awaited DSH hooks own delivery and incoming-message acknowledgement.
   ctx.on('calendar-agent/message', event => service.scheduler.receive(event));
   ctx.on('calendar-agent/reminder-due', async batch => {
@@ -20,7 +22,8 @@ export async function apply(ctx, options) {
     Object.assign(batch, generated);
     batch.result = await service.transport.send(batch);
   });
-  service = await startService(config, {
+  try {service = await startService(config, {
+    balance,
     previewHook: async ({ itemId }) => {
       if (previewing) throw problem('A reminder preview is already running', 409);
       const data = service.store.snapshot();
@@ -43,7 +46,8 @@ export async function apply(ctx, options) {
     sendHook: async batch => { await ctx.parallel('calendar-agent/reminder-due', batch); return batch.result; },
     onEvent: (event, payload) => ctx.emit(`calendar-agent/${event}`, payload),
     log: message => ctx.logger.warn(message)
-  });
-  ctx.effect(() => async () => { await generator.close(); await service.close(); }, 'calendar-agent.service');
+  });} catch(error){await balance.close();await generator.close();throw error;}
+  balance.start();
+  ctx.effect(() => async () => { await balance.close(); await generator.close(); await service.close(); }, 'calendar-agent.service');
   ctx.logger.info(`Calendar agent listening on 127.0.0.1:${service.port}`);
 }

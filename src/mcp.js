@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { localClient } from './client.js';
 import { itemInput } from './model.js';
 import {dailyTaskInput,habitInput} from './routines.js';
-const server = new McpServer({ name: 'dsh-calendar-agent', version: '0.4.0' });
+const server = new McpServer({ name: 'dsh-calendar-agent', version: '0.5.0' });
 const call = async (route, args) => {
   try {
     const client = await localClient(process.argv[2]);

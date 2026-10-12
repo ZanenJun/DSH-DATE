@@ -24,6 +24,8 @@ HTTP 只监听 127.0.0.1，所有端点均要求 `Authorization: Bearer TOKEN`�
 
 | 方法和路径 | 输入/输出 |
 | --- | --- |
+| GET /v1/balance/status | 只读余额监测状态与缓存，附 `text`、`lastSuccessAt`、`lastError`、档位和通知状态；不触发查询 |
+| POST /v1/balance/refresh | 仅接受 `{}`；手动刷新余额，返回状态及固定格式 `text`。新发起的本轮查询不额外发送新档位通知，已有自动查询/402 告警独立处理；未启用监测返回 503 |
 | GET /v1/state | 当前时间、时区、星期、QQ 连接状态、普通 items、dailyTasks 模板、habits 规则、occurrences 和 memory，包含删除记录；另含 latestUserReply、syncBackend 与 icloud 状态，每项附只读 sync 状态 |
 | GET /v1/agent/state | MCP 查询专用：先请求 iCloud 同步，再返回 state 及 toolSync |
 | POST /v1/agent/upsert、delete、action | MCP 修改专用：输入同对应普通接口，先保存，再请求同步；返回原结果及 sync、icloud、toolSync |
@@ -126,3 +128,16 @@ HTTP/内存 schemaVersion 仍为 1，包含可选 `memory`（最近 200 条事�
 - 明确延后结束：保留开始，按指定终点调整 durationMinutes；已开始时保持 enabled=false，仅在明确要求重新提醒时开启。
 
 开始时间保留秒；durationMinutes 为整数，差值向上取整且至少 1 分钟，并向用户说明结束时间精度。普通“完成”而未要求调整结束时间时仍用 calendar_reminder complete。习惯的当次确认不调整规则；修改今天生成的待办不改每日模板。所有更新保留其他可编辑字段，使用最新 baseRevision；重试复用同一 operationId 和请求，CAS 冲突则重读核对。
+
+
+## 余额查询与通知
+
+余额由独立监测器和 DSH provider 适配器维护，不属于日历事项，也不新增 MCP 工具。`balance.enabled` 默认 false；开启后使用 DSH 默认模型的 provider，或配置指定的 `balance.providerId`。查询只使用可解析的官方 DeepSeek 账户，认证经 DSH 凭据服务取得；API key 不进入状态接口、QQ 或余额文件。查询固定发往官方余额端点，拒绝重定向。
+
+查询触发包括启动、默认 1 小时的后台检查、实际模型回合结束后的 10 分钟活跃检查、对应 provider 的结构化 402，以及手动刷新。模型 hook 关联实际请求 provider 和账户绑定，切换账户后旧回合的结果不能污染新账户。并发刷新合并执行，查询失败有退避；不会因日历每 20 秒同步或待办每 30 秒催促而查询一次。
+
+`GET /v1/balance/status` 返回当前状态，`POST /v1/balance/refresh {}` 请求刷新后返回相同结构及 `text`。HTTP 200 只表示请求处理完，仍须查看 `lastError` / `lastSuccessAt`；失败时保留上次成功缓存并标注时间，不能当作当前余额或余额为 0。`balance` 中含 `is_available` 和按币种保存的 `balance_infos`，金额为字符串。`level` 为 unknown / normal / low / critical / exhausted；`confirmedInsufficient` 表示尚未确认恢复的模型余额不足证据。`notification` 单独报告待发送状态、重试时间、上次成功通知及发送错误，不与查询错误混淆。
+
+默认 CNY 阈值为 low=5.00、critical=1.00（包含等值），持续低余额通知冷却 24 小时；更严重档位或恢复按状态变化处理。USD 可独立配置，未配置时不推算汇率。自动告警使用固定正文直接发管理员 QQ，不经过付费模型；402 告警无需等余额接口或 Agent 成功。手动 refresh 新发起的查询不为本轮发现的低余额另发通知，也不把查询回复伪记为自动告警已送达；下一次自动检查继续按规则判断。合并到已有自动查询时，其通知及已有 402 告警仍独立处理。
+
+QQ 精确文字命令依赖 `bin/qq-balance-setup.js` 对桥接的适配：在语音转写和模型就绪检查之前，拦截日历 preset 管理员私聊中的“查余额”“查询余额”“/balance”，用相同的本地 Bearer 接口取得 `text`。失败也直接回复，不回落模型；语音和非精确指令维持原流程。发送前及实际出队时重新检查身份、权限、模式和会话代际，防止过期结果外发。作为 QQ 来信，它仍会触发既有消息 hook 的当次催促确认。安装、配置和终端命令见 [余额功能](BALANCE.md)。

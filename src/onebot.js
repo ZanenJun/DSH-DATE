@@ -32,7 +32,7 @@ export class OneBot {
     if (!this.connected) throw new Error('QQ reply hook disconnected');
     const self = await this.call('get_login_info');
     if (String(self.user_id) !== String(this.config.botQQ)) throw new Error('Unexpected bot QQ; refusing to send');
-    if (batch.isCurrent && !batch.isCurrent()) return { skipped: true };
+    if (batch.isCurrent && !await batch.isCurrent()) return { skipped: true };
     return this.call('send_private_msg', { user_id: Number(this.config.ownerQQ), message: [{ type: 'text', data: { text: batch.text } }] });
   }
   async start() {

@@ -3,6 +3,14 @@
   "port": 3217,
   "timeZone": "Asia/Shanghai",
   "repeatMs": 30000,
+  "balance": {
+    "enabled": false,
+    "intervalMs": 3600000,
+    "activeIntervalMs": 600000,
+    "cooldownMs": 86400000,
+    "timeoutMs": 10000,
+    "thresholds": { "CNY": { "low": "5.00", "critical": "1.00" } }
+  },
   "icloud": { "enabled": false, "intervalMs": 20000 },
   "onebot": {
     "ownerQQ": "10001",

@@ -13,6 +13,7 @@ import { ICloudSync } from './icloud-sync.js';
 import { readConfig } from './config.js';
 import { itemSyncStatus } from './sync-status.js';
 import {syncWindow} from './sync-window.js';
+import {formatBalance} from './balance-format.js';
 
 export async function tokenFor(directory) {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -79,7 +80,7 @@ export async function startService(config, options = {}) {
       send: options.sendHook ?? (async () => { throw Error('Reminder delivery requires the DSH Agent plugin'); }), onEvent: options.onEvent
     });
     server = http.createServer(async (req, res) => {
-      const route = ['/v1/agent/routines/upsert', '/v1/agent/routines/delete', '/v1/routines/upsert', '/v1/routines/delete', '/v1/agent/state', '/v1/agent/upsert', '/v1/agent/delete', '/v1/agent/action', '/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
+      const route = ['/v1/balance/status','/v1/balance/refresh','/v1/agent/routines/upsert', '/v1/agent/routines/delete', '/v1/routines/upsert', '/v1/routines/delete', '/v1/agent/state', '/v1/agent/upsert', '/v1/agent/delete', '/v1/agent/action', '/v1/state', '/v1/projections', '/v1/upsert', '/v1/delete', '/v1/action', '/v1/diagnostics', '/v1/reminder-preview', '/v1/icloud/status', '/v1/icloud/reload', '/v1/icloud/sync', '/v1/icloud/resolve'].includes(req.url?.split('?')[0]) ? req.url.split('?')[0] : 'other';
       const client = /DSHCalendarSync|CFNetwork|Darwin/i.test(req.headers['user-agent'] ?? '') ? 'mac' : 'other';
       const method = ['GET', 'POST'].includes(req.method) ? req.method : 'other';
       res.on('finish', () => {
@@ -102,6 +103,10 @@ export async function startService(config, options = {}) {
         const url = new URL(req.url, 'http://127.0.0.1');
         const agentRoute=['/v1/agent/state','/v1/agent/upsert','/v1/agent/delete','/v1/agent/action','/v1/agent/routines/upsert','/v1/agent/routines/delete'].includes(url.pathname);
         if(agentRoute)url.pathname=url.pathname.replace('/agent/','/');
+        if(req.method==='GET' && url.pathname==='/v1/balance/status') {
+          const status=options.balance?.status()??{enabled:false};
+          return reply(200,{...status,text:formatBalance(status,config.timeZone)});
+        }
         if (req.method === 'GET' && url.pathname === '/v1/diagnostics') return reply(200, diagnostics);
         if (req.method === 'GET' && url.pathname === '/v1/icloud/status') return reply(200,cloudStatus());
         if (req.method === 'GET' && url.pathname === '/v1/state') {
@@ -138,6 +143,13 @@ export async function startService(config, options = {}) {
         if (req.method === 'POST') {
           const input = await body(req);
           if (!input || typeof input !== 'object' || Array.isArray(input)) throw problem('Expected an object');
+          if(url.pathname==='/v1/balance/refresh') {
+            if(Object.keys(input).length)throw problem('Balance refresh takes no parameters');
+            if(!options.balance || !config.balance?.enabled)throw problem('余额监测尚未开启',503);
+            await options.balance.refresh({reason:'manual',notify:false});
+            const status=options.balance.status();
+            return reply(200,{...status,text:formatBalance(status,config.timeZone)});
+          }
           if(url.pathname==='/v1/icloud/reload') {
             if(!config.sourceFile)throw problem('当前服务没有配置文件位置',409);
             const next=await readConfig(config.sourceFile);
