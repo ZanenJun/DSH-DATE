@@ -124,7 +124,9 @@ DSH preset 已自动通过 stdio 连接本插件 MCP。其他 MCP 客户端也�
 
 MCP 只在标准输出传协议消息；工具为 `calendar_list`、`calendar_save`、`calendar_delete`、`calendar_reminder`、`routine_save`、`routine_delete`。`calendar_list` 分开返回普通事项、每日必做模板和习惯；新增的 routine 工具只管理模板或习惯规则。独立运行 `node bin/calendar.js serve` 仅提供数据服务和同步接口；Agent 催促需要在 DSH 中加载本插件。DSH 内的名字加前缀 `mcp__calendar__`。
 
-可在本地配置文件增加 `reminder: { "tone": "亲切简短，未回复时更直接", "timeoutMs": 45000 }`，重启 DSH 后生效。提醒 Agent 使用 DSH 默认模型，没有写入或发送工具；生成成功后由 hook 核验最新状态再投递。对话 Agent 保留六个日历与规则 MCP 工具。
+对话与主动提醒共用 [P1–P3 人格提示词](src/persona.js)：嘴硬心软、有分寸的傲娇，带一点小俏皮；不强演口头禅，不添加动作或内心旁白，用户疲惫时收起调侃。普通聊天通常一至三句，需要解释时展开；人格只影响表达，不改变日历操作与事实确认规则。
+
+可在本地配置文件增加 `reminder: { "tone": "轻俏简短，未回复时更直接，不责备或制造负担", "timeoutMs": 45000 }`，重启 DSH 后生效。这是统一人格范围内的提醒语气补充。提醒 Agent 使用 DSH 默认模型，没有写入或发送工具；生成成功后由 hook 核验最新状态再投递。对话 Agent 保留六个日历与规则 MCP 工具。
 
 ## 旧 Mac 后端接入（仅未启用 iCloud 直连时）
 

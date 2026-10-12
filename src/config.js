@@ -14,13 +14,14 @@ const amount=z.string().regex(/^\d{1,12}(?:\.\d{1,8})?$/, 'Use a positive decima
 const thresholds=z.partialRecord(z.enum(['CNY','USD']),z.object({low:amount,critical:amount}).strict()
   .refine(v=>Number(v.critical)>0 && Number(v.low)>Number(v.critical),'low must be greater than critical, both positive'));
 export const balanceDefaults={enabled:false,intervalMs:3600000,activeIntervalMs:600000,cooldownMs:86400000,timeoutMs:10000,thresholds:{CNY:{low:'5.00',critical:'1.00'}}};
+const defaultReminderTone='嘴硬心软、有分寸的傲娇，带一点小俏皮，表达简短自然；连续未回复时逐渐直接，但不施压、责备或制造负担，用户疲惫难受时收起调侃。';
 const configSchema = z.object({
   dataDir: z.string().min(1), port: z.number().int().min(0).max(65535).default(3217),
   timeZone: z.string().refine(v => IANAZone.isValidZone(v), 'Invalid time zone').default('Asia/Shanghai'), repeatMs: z.number().int().min(30000).default(30000),
   reminder: z.object({
-    tone: z.string().min(1).max(1000).default('像熟悉我的日程助理，亲切、简洁，连续未回复时逐渐直接，但不施压或责备。'),
+    tone: z.string().min(1).max(1000).default(defaultReminderTone),
     timeoutMs: z.number().int().min(1000).max(120000).default(45000)
-  }).default({ tone: '像熟悉我的日程助理，亲切、简洁，连续未回复时逐渐直接，但不施压或责备。', timeoutMs: 45000 }),
+  }).default({ tone: defaultReminderTone, timeoutMs: 45000 }),
   balance:z.object({
     enabled:z.boolean().default(false),providerId:z.string().min(1).max(200).optional(),
     intervalMs:z.number().int().min(60000).max(86400000).default(3600000),
